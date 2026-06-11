@@ -14,11 +14,14 @@ export default function ParticipantPlay() {
   const [currentQuestion, setCurrentQuestion] = useState(null);
   const [userResponse, setUserResponse] = useState(null); // existing answer if submitted
   const [answerInput, setAnswerInput] = useState(''); // text answer
-  const [selectedOption, setSelectedOption] = useState(''); // MC answer
+  const [selectedOptions, setSelectedOptions] = useState([]); // MC answers
   const [selectedRating, setSelectedRating] = useState(0); // Rating answer
+  const [selectionError, setSelectionError] = useState('');
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+  const [localCountdown, setLocalCountdown] = useState(0);
+  const localTimerRef = useRef(null);
 
   const currentQuestionIdRef = useRef(null);
 
@@ -37,19 +40,34 @@ export default function ParticipantPlay() {
         { event: 'UPDATE', schema: 'public', table: 'polls', filter: `id=eq.${poll.id}` },
         async (payload) => {
           const updatedPoll = payload.new;
+          if (!updatedPoll) return;
+
           setPoll(updatedPoll);
-          
+
           if (updatedPoll.status === 'ended') {
+            currentQuestionIdRef.current = null;
             setCurrentQuestion(null);
             setUserResponse(null);
-          } else if (updatedPoll.current_question_id !== currentQuestionIdRef.current) {
-            // Host changed question!
-            if (updatedPoll.current_question_id) {
-              fetchQuestion(updatedPoll.current_question_id);
-            } else {
-              setCurrentQuestion(null);
-              setUserResponse(null);
+            return;
+          }
+
+          const nextQuestionId = updatedPoll.current_question_id;
+          if (!nextQuestionId) {
+            currentQuestionIdRef.current = null;
+            setCurrentQuestion(null);
+            setUserResponse(null);
+            if (localTimerRef.current) {
+              clearInterval(localTimerRef.current);
+              localTimerRef.current = null;
             }
+            return;
+          }
+
+          if (nextQuestionId !== currentQuestionIdRef.current) {
+            currentQuestionIdRef.current = nextQuestionId;
+            setCurrentQuestion(null);
+            setUserResponse(null);
+            await fetchQuestion(nextQuestionId);
           }
         }
       )
@@ -59,6 +77,15 @@ export default function ParticipantPlay() {
       supabase.removeChannel(pollChannel);
     };
   }, [poll?.id]);
+
+  useEffect(() => {
+    return () => {
+      if (localTimerRef.current) {
+        clearInterval(localTimerRef.current);
+        localTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const fetchInitialState = async () => {
     try {
@@ -130,8 +157,25 @@ export default function ParticipantPlay() {
       
       // Reset input fields
       setAnswerInput('');
-      setSelectedOption('');
+      setSelectedOptions([]);
+      setSelectionError('');
       setSelectedRating(0);
+
+      // Start local countdown for this question (20s)
+      setLocalCountdown(20);
+      if (localTimerRef.current) {
+        clearInterval(localTimerRef.current);
+      }
+      localTimerRef.current = setInterval(() => {
+        setLocalCountdown((prev) => {
+          if (prev <= 1) {
+            clearInterval(localTimerRef.current);
+            localTimerRef.current = null;
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
 
       // Check if participant already answered this question
       if (pId) {
@@ -184,7 +228,7 @@ export default function ParticipantPlay() {
 
     const interval = setInterval(() => {
       refreshPollState();
-    }, 8000);
+    }, 2000);
 
     return () => clearInterval(interval);
   }, [poll?.id, poll?.status]);
@@ -193,13 +237,18 @@ export default function ParticipantPlay() {
     if (e) e.preventDefault();
     if (!currentQuestion || !participant) return;
 
+    if (localCountdown === 0) {
+      setSelectionError('Time is up for this question.');
+      return;
+    }
+
     let answerText = '';
     if (currentQuestion.type === 'multiple_choice') {
-      if (!selectedOption) {
-        alert('Please select an option.');
+      if (!selectedOptions.length) {
+        setSelectionError('Please select at least one option.');
         return;
       }
-      answerText = selectedOption;
+      answerText = selectedOptions.join(', ');
     } else if (currentQuestion.type === 'rating') {
       if (selectedRating === 0) {
         alert('Please choose a rating.');
@@ -293,9 +342,6 @@ export default function ParticipantPlay() {
           <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
             This screen will update automatically.
           </p>
-          <button className="btn btn-secondary" onClick={refreshPollState} style={{ marginTop: '1rem' }}>
-            Refresh Now
-          </button>
         </div>
       </div>
     );
@@ -318,9 +364,6 @@ export default function ParticipantPlay() {
               Hold tight. The host will switch to the next question shortly!
             </p>
           </div>
-          <button className="btn btn-secondary" onClick={refreshPollState} style={{ marginTop: '1rem' }}>
-            Check for Next Question
-          </button>
         </div>
       </div>
     );
@@ -335,23 +378,40 @@ export default function ParticipantPlay() {
         <form onSubmit={handleSubmitAnswer}>
           {/* Render inputs depending on type */}
           {currentQuestion.type === 'multiple_choice' && (
-            <div style={{ marginBottom: '2rem' }}>
+            <div style={{ marginBottom: '1rem' }}>
+              {localCountdown > 0 && (
+                <div style={{ marginBottom: '0.5rem', fontWeight: 600, color: 'var(--color-accent)' }}>
+                  Time remaining: {localCountdown}s
+                </div>
+              )}
               {(currentQuestion.options || []).map((option, idx) => {
-                const letter = String.fromCharCode(65 + idx); // A, B, C, D...
-                const isSelected = selectedOption === option;
+                const number = idx + 1;
+                const isSelected = selectedOptions.includes(option);
                 return (
                   <button
                     key={idx}
                     type="button"
                     className={`mc-option-button ${isSelected ? 'selected' : ''}`}
-                    onClick={() => setSelectedOption(option)}
-                    disabled={submitting}
+                    onClick={() => {
+                      setSelectionError('');
+                      if (isSelected) {
+                        setSelectedOptions((prev) => prev.filter((value) => value !== option));
+                      } else if (selectedOptions.length < 3) {
+                        setSelectedOptions((prev) => [...prev, option]);
+                      } else {
+                        setSelectionError('You can select up to 3 options.');
+                      }
+                    }}
+                    disabled={submitting || localCountdown === 0}
                   >
                     <span style={{ fontWeight: 500 }}>{option}</span>
-                    <span className="option-letter">{letter}</span>
+                    <span className="option-letter">{number}</span>
                   </button>
                 );
               })}
+              <p style={{ marginTop: '0.75rem', fontSize: '0.95rem', color: selectionError ? 'var(--color-danger)' : 'var(--text-muted)' }}>
+                {selectionError || `Selected ${selectedOptions.length}/3 options.`}
+              </p>
             </div>
           )}
 

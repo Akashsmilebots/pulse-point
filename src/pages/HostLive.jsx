@@ -20,6 +20,14 @@ export default function HostLive() {
   const [savingDraft, setSavingDraft] = useState(false);
   const [saveMessage, setSaveMessage] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
+  const [questionSearch, setQuestionSearch] = useState('');
+  const [draftQuestionIndex, setDraftQuestionIndex] = useState(0);
+  const [questionCountdown, setQuestionCountdown] = useState(0);
+  const questionTimerRef = useRef(null);
+  const [rangeLeaderboard, setRangeLeaderboard] = useState([]);
+  const [overallLeaderboard, setOverallLeaderboard] = useState([]);
+  const [showRangeLeaderboard, setShowRangeLeaderboard] = useState(false);
+  const [showOverallLeaderboard, setShowOverallLeaderboard] = useState(false);
 
   // Keep a ref to the active question ID for the realtime channel callback
   const activeQuestionIdRef = useRef(null);
@@ -27,6 +35,16 @@ export default function HostLive() {
   useEffect(() => {
     fetchPollAndQuestions();
   }, [id]);
+
+  useEffect(() => {
+    if (poll?.status === 'draft' && questions.length > 0) {
+      setDraftQuestionIndex(0);
+    }
+  }, [poll?.status, questions.length]);
+
+  useEffect(() => {
+    setDraftQuestionIndex(0);
+  }, [questionSearch]);
 
   useEffect(() => {
     if (!poll) return;
@@ -144,14 +162,18 @@ export default function HostLive() {
   };
 
   const handleAddQuestion = () => {
-    setQuestions([
+    const updated = [
       ...questions,
-      { text: '', type: 'multiple_choice', options: ['Option 1', 'Option 2'] }
-    ]);
+      { text: '', type: 'multiple_choice', options: ['Option 1', 'Option 2', 'Option 3'] }
+    ];
+    setQuestions(updated);
+    setDraftQuestionIndex(updated.length - 1);
   };
 
   const handleRemoveQuestion = (index) => {
-    setQuestions(questions.filter((_, idx) => idx !== index));
+    const updated = questions.filter((_, idx) => idx !== index);
+    setQuestions(updated);
+    setDraftQuestionIndex((prev) => Math.max(0, Math.min(prev, updated.length - 1)));
   };
 
   const handleQuestionTextChange = (index, value) => {
@@ -164,7 +186,7 @@ export default function HostLive() {
     const updated = [...questions];
     updated[index].type = type;
     if (type === 'multiple_choice' && (!updated[index].options || updated[index].options.length === 0)) {
-      updated[index].options = ['Option 1', 'Option 2'];
+      updated[index].options = ['Option 1', 'Option 2', 'Option 3'];
     }
     if (type !== 'multiple_choice') {
       updated[index].options = [];
@@ -180,6 +202,15 @@ export default function HostLive() {
 
   const handleAddOption = (qIndex) => {
     const updated = [...questions];
+    if (!updated[qIndex].options || !Array.isArray(updated[qIndex].options)) {
+      updated[qIndex].options = ['Option 1', 'Option 2', 'Option 3'];
+      setQuestions(updated);
+      return;
+    }
+    if (updated[qIndex].options.length >= 20) {
+      setErrorMessage('Multiple choice questions can have up to 20 options.');
+      return;
+    }
     updated[qIndex].options.push(`Option ${updated[qIndex].options.length + 1}`);
     setQuestions(updated);
   };
@@ -294,6 +325,100 @@ export default function HostLive() {
     }
   };
 
+  // Compute leaderboard for an array of question IDs
+  const computeLeaderboard = async (questionIds) => {
+    try {
+      if (!questionIds || questionIds.length === 0) return [];
+      const { data, error } = await supabase
+        .from('responses')
+        .select(`id, answer, question_id, participant_id, participants (id, name, phone)`)
+        .in('question_id', questionIds);
+
+      if (error) throw error;
+
+      // Group responses by question
+      const responsesByQuestion = {};
+      data.forEach((r) => {
+        responsesByQuestion[r.question_id] = responsesByQuestion[r.question_id] || [];
+        responsesByQuestion[r.question_id].push(r);
+      });
+
+      const pointsByParticipant = {};
+
+      // For each question, compute top-10 options and award points per selection
+      for (const qId of questionIds) {
+        const q = questions.find((qq) => qq.id === qId);
+        if (!q) continue;
+        const resps = responsesByQuestion[qId] || [];
+
+        // Tally votes per option
+        const tallies = {};
+        (q.options || []).forEach((opt) => { tallies[opt] = 0; });
+        resps.forEach((r) => {
+          const parts = (r.answer || '').split(',').map((s) => s.trim()).filter(Boolean);
+          parts.forEach((p) => {
+            if (tallies[p] !== undefined) tallies[p]++;
+          });
+        });
+
+        // Determine top-10 options
+        const sortedOpts = Object.keys(tallies).sort((a, b) => tallies[b] - tallies[a]);
+        const top10 = sortedOpts.slice(0, 10);
+        const rankMap = {};
+        top10.forEach((opt, idx) => { rankMap[opt] = idx + 1; });
+
+        // Award points to participants based on their selected options
+        resps.forEach((r) => {
+          const pid = r.participant_id;
+          if (!pointsByParticipant[pid]) {
+            pointsByParticipant[pid] = { name: r.participants?.name || 'Anonymous', phone: r.participants?.phone || '', points: 0 };
+          }
+          const parts = (r.answer || '').split(',').map((s) => s.trim()).filter(Boolean);
+          parts.forEach((p) => {
+            const rank = rankMap[p];
+            if (rank) {
+              pointsByParticipant[pid].points += (11 - rank);
+            }
+          });
+        });
+      }
+
+      const arr = Object.keys(pointsByParticipant).map((pid) => ({ participant_id: pid, name: pointsByParticipant[pid].name, phone: pointsByParticipant[pid].phone, points: pointsByParticipant[pid].points }));
+      arr.sort((a, b) => b.points - a.points);
+      return arr;
+    } catch (err) {
+      console.error('Error computing leaderboard:', err);
+      return [];
+    }
+  };
+
+  const showLeaderboardForRange = async (startIndexInclusive) => {
+    const slice = questions.slice(startIndexInclusive, startIndexInclusive + 10);
+    const qIds = slice.map(q => q.id).filter(Boolean);
+    const lb = await computeLeaderboard(qIds);
+    setRangeLeaderboard(lb);
+    setShowRangeLeaderboard(true);
+  };
+
+  const showOverall = async () => {
+    const qIds = questions.map(q => q.id).filter(Boolean);
+    const lb = await computeLeaderboard(qIds);
+    setOverallLeaderboard(lb);
+    setShowOverallLeaderboard(true);
+  };
+
+  // When current question moves and it's the 10th, 20th, etc., show range leaderboard
+  useEffect(() => {
+    if (!currentQuestion || questions.length === 0) return;
+    const idx = questions.findIndex(q => q.id === currentQuestion.id);
+    if (idx < 0) return;
+    const qNumber = idx + 1;
+    if (qNumber % 10 === 0) {
+      const start = Math.floor(idx / 10) * 10;
+      showLeaderboardForRange(start);
+    }
+  }, [currentQuestion?.id]);
+
   const handleStartPoll = async () => {
     setErrorMessage('');
     if (questions.length === 0) {
@@ -305,33 +430,75 @@ export default function HostLive() {
     if (!saved) return;
 
     try {
-      const { data: firstQ, error: firstQError } = await supabase
-        .from('questions')
-        .select('*')
-        .eq('poll_id', poll.id)
-        .order('order_index', { ascending: true })
-        .limit(1)
-        .single();
-
-      if (firstQError || !firstQ) {
-        setErrorMessage('Unable to find the first question after saving the draft.');
-        return;
-      }
-
+      // Start session but do not start the first question automatically.
       const { error } = await supabase
         .from('polls')
         .update({
           status: 'active',
-          current_question_id: firstQ.id
+          current_question_id: null
         })
         .eq('id', poll.id);
 
       if (error) throw error;
-      setPoll({ ...poll, status: 'active', current_question_id: firstQ.id });
-      setCurrentQuestion(firstQ);
+      setPoll({ ...poll, status: 'active', current_question_id: null });
     } catch (err) {
       console.error(err);
       setErrorMessage('Failed to start poll. Please try again.');
+    }
+  };
+
+  const clearQuestionTimer = () => {
+    if (questionTimerRef.current) {
+      clearInterval(questionTimerRef.current);
+      questionTimerRef.current = null;
+    }
+    setQuestionCountdown(0);
+  };
+
+  const endQuestionOnServer = async () => {
+    try {
+      const { error } = await supabase
+        .from('polls')
+        .update({ current_question_id: null })
+        .eq('id', poll.id);
+      if (error) console.error('Error clearing current_question_id:', error);
+      setPoll((p) => ({ ...p, current_question_id: null }));
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const startQuestionTimer = (seconds = 20) => {
+    clearQuestionTimer();
+    setQuestionCountdown(seconds);
+    questionTimerRef.current = setInterval(() => {
+      setQuestionCountdown((prev) => {
+        if (prev <= 1) {
+          clearQuestionTimer();
+          // End question for participants by clearing current_question_id
+          endQuestionOnServer();
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  };
+
+  const handleStartQuestion = async (q) => {
+    if (!poll) return;
+    try {
+      const { error } = await supabase
+        .from('polls')
+        .update({ current_question_id: q.id })
+        .eq('id', poll.id);
+      if (error) throw error;
+      setPoll({ ...poll, current_question_id: q.id });
+      setCurrentQuestion(q);
+      // Start 20s timer for this question
+      startQuestionTimer(20);
+    } catch (err) {
+      console.error('Failed to start question:', err);
+      setErrorMessage('Failed to start question.');
     }
   };
 
@@ -412,9 +579,12 @@ export default function HostLive() {
   };
 
   const handleNextQuestion = () => {
+    if (!currentQuestion) return;
     const currentIndex = questions.findIndex(q => q.id === currentQuestion.id);
     if (currentIndex < questions.length - 1) {
-      handleSetActiveQuestion(questions[currentIndex + 1]);
+      const nextQ = questions[currentIndex + 1];
+      // Start next question immediately (updates server and participants)
+      handleStartQuestion(nextQ);
     }
   };
 
@@ -439,20 +609,29 @@ export default function HostLive() {
     const totalVotes = responses.length;
     const options = currentQuestion.options || [];
 
-    // Tally answers
+    // Tally answers allowing multi-select responses
     const tallies = {};
     options.forEach(opt => { tallies[opt] = 0; });
     responses.forEach(r => {
-      if (tallies[r.answer] !== undefined) {
-        tallies[r.answer]++;
-      } else {
-        tallies[r.answer] = 1;
-      }
+      const answers = (r.answer || '').split(',').map((part) => part.trim()).filter(Boolean);
+      answers.forEach((answerPart) => {
+        if (tallies[answerPart] !== undefined) {
+          tallies[answerPart] += 1;
+        }
+      });
+    });
+
+    // Sort options by votes desc, tie-break alphabetically
+    const sortedOptions = options.slice().sort((a, b) => {
+      const da = tallies[a] || 0;
+      const db = tallies[b] || 0;
+      if (db !== da) return db - da;
+      return a.localeCompare(b);
     });
 
     return (
       <div className="results-container">
-        {options.map((opt, idx) => {
+        {sortedOptions.map((opt, idx) => {
           const votes = tallies[opt] || 0;
           const pct = totalVotes > 0 ? Math.round((votes / totalVotes) * 100) : 0;
           return (
@@ -552,6 +731,19 @@ export default function HostLive() {
 
   const currentIndex = questions.findIndex(q => q.id === currentQuestion?.id);
 
+  const filteredQuestions = questions
+    .map((q, idx) => ({ ...q, questionNumber: idx + 1, originalIndex: idx }))
+    .filter((q) => {
+      const search = questionSearch.trim().toLowerCase();
+      if (!search) return true;
+      const optionText = (q.options || []).join(' ').toLowerCase();
+      return (
+        q.text?.toLowerCase().includes(search) ||
+        String(q.questionNumber).includes(search) ||
+        optionText.includes(search)
+      );
+    });
+
   return (
     <div>
       {/* Top action bar */}
@@ -560,16 +752,6 @@ export default function HostLive() {
           <ArrowLeft size={16} /> Back to Dashboard
         </button>
         <div style={{ display: 'flex', gap: '0.75rem' }}>
-          {poll.status === 'draft' && (
-            <button className="btn btn-secondary" onClick={handleSaveDraft} disabled={savingDraft || loading}>
-              <Save size={16} /> Save Draft
-            </button>
-          )}
-          {poll.status === 'draft' && (
-            <button className="btn btn-success" onClick={handleStartPoll} disabled={questions.length === 0 || savingDraft || loading}>
-              <Play size={16} /> Start Poll Session
-            </button>
-          )}
           {poll.status === 'active' && (
             <button className="btn btn-danger" onClick={handleEndPoll}>
               <Square size={16} /> End Session
@@ -632,6 +814,36 @@ export default function HostLive() {
                 />
               </div>
 
+              {/* CSV import placed directly under Event Title for quick bulk add */}
+              <div style={{ marginBottom: '1rem', display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <input type="file" accept=".csv,text/csv" style={{ display: 'none' }} onChange={async (e) => {
+                    const f = e.target.files && e.target.files[0];
+                    if (!f) return;
+                    try {
+                      const text = await f.text();
+                      const lines = text.split(/\r?\n/).filter(Boolean);
+                      const parsed = lines.map((ln) => {
+                        // naive CSV split on commas (preserves all options)
+                        const cols = ln.split(',').map(c => c.trim());
+                        const qText = cols[0] || '';
+                        const opts = cols.slice(1).map(o => o.trim()).filter(Boolean);
+                        return { text: qText, type: opts.length ? 'multiple_choice' : 'open_text', options: opts.length ? opts : [] };
+                      });
+                      setQuestions(parsed);
+                      setDraftQuestionIndex(0);
+                    } catch (err) {
+                      console.error('Failed to parse CSV', err);
+                      setErrorMessage('Failed to parse CSV file.');
+                    }
+                  }} />
+                  <button className="btn btn-secondary" onClick={(e) => { const input = e.currentTarget.previousSibling; input && input.click(); }}>
+                    Import CSV
+                  </button>
+                </label>
+                <div style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>Or add questions manually below.</div>
+              </div>
+
               {saveMessage && (
                 <div style={{ marginBottom: '1rem', color: 'var(--color-success)', fontWeight: 600 }}>
                   {saveMessage}
@@ -649,106 +861,189 @@ export default function HostLive() {
                 <div style={{ padding: '1.5rem', border: '1px dashed var(--border-color)', borderRadius: '16px', color: 'var(--text-secondary)' }}>
                   No questions yet. Add your first question and save the draft.
                 </div>
+              ) : filteredQuestions.length === 0 ? (
+                <div style={{ padding: '1.5rem', border: '1px dashed var(--border-color)', borderRadius: '16px', color: 'var(--text-secondary)' }}>
+                  No matching questions found. Try a different search term.
+                </div>
               ) : (
-                <div style={{ display: 'grid', gap: '1rem' }}>
-                  {questions.map((q, idx) => (
-                    <div className="question-card" key={idx} style={{ padding: '1.25rem', borderRadius: '18px', border: '1px solid var(--border-color)' }}>
-                      <div className="question-card-header">
-                        <span className="question-number">Question {idx + 1}</span>
-                        <div style={{ display: 'flex', gap: '0.5rem' }}>
-                          <button
-                            type="button"
-                            className="btn btn-secondary btn-sm"
-                            onClick={() => handleMoveQuestion(idx, 'up')}
-                            disabled={idx === 0 || savingDraft || loading}
-                            style={{ padding: '0.25rem 0.5rem' }}
-                          >
-                            <ChevronLeft size={14} />
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-secondary btn-sm"
-                            onClick={() => handleMoveQuestion(idx, 'down')}
-                            disabled={idx === questions.length - 1 || savingDraft || loading}
-                            style={{ padding: '0.25rem 0.5rem' }}
-                          >
-                            <ChevronRight size={14} />
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-danger btn-sm"
-                            onClick={() => handleRemoveQuestion(idx)}
-                            disabled={savingDraft || loading}
-                            style={{ padding: '0.25rem 0.5rem' }}
-                          >
-                            <Square size={14} />
-                          </button>
-                        </div>
-                      </div>
+                <div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+                    <div>
+                      <span className="question-number">Question {draftQuestionIndex + 1} of {filteredQuestions.length}</span>
+                      <p style={{ margin: '0.25rem 0 0', color: 'var(--text-secondary)' }}>
+                        Showing one question at a time for easier editing.
+                      </p>
+                    </div>
+                    <div style={{ display: 'flex', gap: '0.5rem' }}>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => setDraftQuestionIndex((prev) => Math.max(prev - 1, 0))}
+                        disabled={draftQuestionIndex === 0}
+                      >
+                        <ChevronLeft size={14} /> Previous
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => setDraftQuestionIndex((prev) => Math.min(prev + 1, filteredQuestions.length - 1))}
+                        disabled={draftQuestionIndex === filteredQuestions.length - 1}
+                      >
+                        Next <ChevronRight size={14} />
+                      </button>
+                    </div>
+                  </div>
 
-                      <div className="form-group">
-                        <label className="form-label">Question Text</label>
-                        <input
-                          type="text"
-                          className="form-input"
-                          placeholder="Enter your question"
-                          value={q.text}
-                          onChange={(e) => handleQuestionTextChange(idx, e.target.value)}
-                          disabled={savingDraft || loading}
-                        />
-                      </div>
+                  <div className="question-card" style={{ padding: '1.5rem', borderRadius: '18px', border: '1px solid var(--border-color)', marginBottom: '1.5rem' }}>
+                    {(() => {
+                      const currentDraftQuestion = filteredQuestions[draftQuestionIndex];
+                      if (!currentDraftQuestion) return null;
+                      return (
+                        <>
+                          <div className="question-card-header" style={{ marginBottom: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                            <span className="question-number">Question {currentDraftQuestion.questionNumber}</span>
+                            <button
+                              type="button"
+                              className="btn btn-danger btn-sm"
+                              onClick={() => handleRemoveQuestion(currentDraftQuestion.originalIndex)}
+                              disabled={savingDraft || loading}
+                              style={{ padding: '0.25rem 0.5rem' }}
+                            >
+                              <Square size={14} /> Remove
+                            </button>
+                          </div>
 
-                      <div className="form-group">
-                        <label className="form-label">Question Type</label>
-                        <select
-                          className="form-select"
-                          value={q.type}
-                          onChange={(e) => handleQuestionTypeChange(idx, e.target.value)}
-                          disabled={savingDraft || loading}
-                        >
-                          <option value="multiple_choice">Multiple Choice</option>
-                          <option value="open_text">Open Text</option>
-                          <option value="rating">Rating</option>
-                        </select>
-                      </div>
+                          <div className="form-group">
+                            <label className="form-label">Question Text</label>
+                            <input
+                              type="text"
+                              className="form-input"
+                              placeholder="Enter your question"
+                              value={currentDraftQuestion.text}
+                              onChange={(e) => handleQuestionTextChange(currentDraftQuestion.originalIndex, e.target.value)}
+                              disabled={savingDraft || loading}
+                            />
+                          </div>
 
-                      {q.type === 'multiple_choice' && (
-                        <div className="question-options-editor">
-                          <label className="form-label" style={{ fontSize: '0.85rem' }}>Options</label>
-                          {q.options.map((option, oIndex) => (
-                            <div className="option-row" key={oIndex}>
-                              <input
-                                type="text"
-                                className="form-input"
-                                style={{ flex: 1, padding: '0.5rem 0.75rem', fontSize: '0.9rem' }}
-                                value={option}
-                                onChange={(e) => handleOptionChange(idx, oIndex, e.target.value)}
-                                disabled={savingDraft || loading}
-                              />
+                          <div className="form-group">
+                            <label className="form-label">Question Type</label>
+                            <select
+                              className="form-select"
+                              value={currentDraftQuestion.type}
+                              onChange={(e) => handleQuestionTypeChange(currentDraftQuestion.originalIndex, e.target.value)}
+                              disabled={savingDraft || loading}
+                            >
+                              <option value="multiple_choice">Multiple Choice</option>
+                              <option value="open_text">Open Text</option>
+                              <option value="rating">Rating</option>
+                            </select>
+                          </div>
+
+                          {currentDraftQuestion.type === 'multiple_choice' && (
+                            <div className="question-options-editor">
+                              <label className="form-label" style={{ fontSize: '0.85rem' }}>Options</label>
+                              {currentDraftQuestion.options.map((option, oIndex) => (
+                                <div className="option-row" key={oIndex}>
+                                  <input
+                                    type="text"
+                                    className="form-input"
+                                    style={{ flex: 1, padding: '0.5rem 0.75rem', fontSize: '0.9rem' }}
+                                    value={option}
+                                    onChange={(e) => handleOptionChange(currentDraftQuestion.originalIndex, oIndex, e.target.value)}
+                                    disabled={savingDraft || loading}
+                                  />
+                                  <button
+                                    type="button"
+                                    className="btn btn-danger btn-sm"
+                                    onClick={() => handleRemoveOption(currentDraftQuestion.originalIndex, oIndex)}
+                                    disabled={savingDraft || loading}
+                                    style={{ padding: '0.5rem' }}
+                                  >
+                                    <Square size={14} />
+                                  </button>
+                                </div>
+                              ))}
                               <button
                                 type="button"
-                                className="btn btn-danger btn-sm"
-                                onClick={() => handleRemoveOption(idx, oIndex)}
-                                disabled={savingDraft || loading}
-                                style={{ padding: '0.5rem' }}
+                                className="btn btn-secondary btn-sm"
+                                style={{ width: 'fit-content', marginTop: '0.5rem' }}
+                                onClick={() => handleAddOption(currentDraftQuestion.originalIndex)}
+                                disabled={currentDraftQuestion.options.length >= 20 || savingDraft || loading}
                               >
-                                <Square size={14} />
+                                <Plus size={12} /> Add Option
                               </button>
+                              {currentDraftQuestion.options.length >= 20 && (
+                                <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginTop: '0.5rem' }}>
+                                  Maximum of 20 options per question.
+                                </div>
+                              )}
                             </div>
-                          ))}
-                          <button
-                            type="button"
-                            className="btn btn-secondary btn-sm"
-                            style={{ width: 'fit-content', marginTop: '0.5rem' }}
-                            onClick={() => handleAddOption(idx)}
-                            disabled={savingDraft || loading}
-                          >
-                            <Plus size={12} /> Add Option
-                          </button>
-                        </div>
-                      )}
+                          )}
+                        </>
+                      );
+                    })()}
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', marginBottom: '1.5rem' }}>
+                    <button
+                      className="btn btn-secondary"
+                      onClick={() => setDraftQuestionIndex((prev) => Math.max(prev - 1, 0))}
+                      disabled={draftQuestionIndex === 0}
+                    >
+                      <ChevronLeft size={16} /> Previous Question
+                    </button>
+                    <button
+                      className="btn btn-secondary"
+                      onClick={() => setDraftQuestionIndex((prev) => Math.min(prev + 1, filteredQuestions.length - 1))}
+                      disabled={draftQuestionIndex === filteredQuestions.length - 1}
+                    >
+                      Next Question <ChevronRight size={16} />
+                    </button>
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <input type="file" accept=".csv,text/csv" style={{ display: 'none' }} onChange={async (e) => {
+                        const f = e.target.files && e.target.files[0];
+                        if (!f) return;
+                        try {
+                          const text = await f.text();
+                          const lines = text.split(/\r?\n/).filter(Boolean);
+                          const parsed = lines.map((ln) => {
+                            // naive CSV split on commas
+                            const cols = ln.split(',').map(c => c.trim());
+                            const qText = cols[0] || '';
+                            const opts = cols.slice(1).map(o => o.trim()).filter(Boolean);
+                            return { text: qText, type: opts.length ? 'multiple_choice' : 'open_text', options: opts.length ? opts : [] };
+                          });
+                          // Replace current draft with imported CSV questions.
+                          // If the existing draft contains only a placeholder empty question, it will be overwritten.
+                          setQuestions(parsed);
+                          setDraftQuestionIndex(0);
+                          setSaveMessage(`Imported ${parsed.length} question${parsed.length !== 1 ? 's' : ''}.`);
+                          setTimeout(() => setSaveMessage(''), 3000);
+                        } catch (err) {
+                          console.error('Failed to parse CSV', err);
+                          setErrorMessage('Failed to parse CSV file.');
+                        }
+                      }} />
+                      <button className="btn btn-secondary" onClick={(e) => { const input = e.currentTarget.previousSibling; input && input.click(); }}>
+                        Import CSV
+                      </button>
+                    </label>
+                    <button className="btn btn-secondary" onClick={handleSaveDraft} disabled={savingDraft || loading}>
+                      <Save size={16} /> Save Draft
+                    </button>
+                    <button className="btn btn-success" onClick={handleStartPoll} disabled={questions.length === 0 || savingDraft || loading}>
+                      <Play size={16} /> Start Poll Session
+                    </button>
+                  </div>
+
+                  {saveMessage && (
+                    <div style={{ marginTop: '1rem', color: 'var(--color-success)', fontWeight: 600 }}>
+                      {saveMessage}
                     </div>
-                  ))}
+                  )}
                 </div>
               )}
             </div>
@@ -769,12 +1064,88 @@ export default function HostLive() {
                   <Users size={16} color="var(--color-accent)" />
                   <span style={{ fontSize: '0.9rem', fontWeight: 600 }}>{responses.length} responses</span>
                 </div>
+                <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                  {poll.status === 'active' && !poll.current_question_id && (
+                    <button className="btn btn-success" onClick={() => handleStartQuestion(currentQuestion)}>
+                      Start Question
+                    </button>
+                  )}
+                  {questionCountdown > 0 && (
+                    <div style={{ padding: '0.5rem 0.75rem', borderRadius: '12px', background: 'rgba(255,255,255,0.03)', fontWeight: 700 }}>
+                      Time left: {questionCountdown}s
+                    </div>
+                  )}
+                </div>
               </div>
 
               {/* Show different visualization based on question type */}
               {currentQuestion.type === 'multiple_choice' && renderMCResults()}
               {currentQuestion.type === 'rating' && renderRatingResults()}
               {currentQuestion.type === 'open_text' && renderOpenTextResults()}
+
+              {/* Leaderboard controls & displays */}
+              <div style={{ marginTop: '1.5rem', marginBottom: '1.5rem' }}>
+                <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                  <button className="btn btn-secondary" onClick={() => showLeaderboardForRange(0)}>
+                    Show First 10 Leaderboard
+                  </button>
+                  <button className="btn btn-secondary" onClick={showOverall}>
+                    Show Overall Leaderboard
+                  </button>
+                </div>
+
+                {showRangeLeaderboard && (
+                  <div style={{ marginTop: '1rem' }}>
+                    <h4 style={{ marginBottom: '0.5rem' }}>Leaderboard (range)</h4>
+                    {rangeLeaderboard.length === 0 ? <div>No scores yet.</div> : (
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '12px' }}>
+                        {rangeLeaderboard.map((p, idx) => (
+                          <div key={p.participant_id} className={`mc-option-button`} style={{ padding: '12px', display: 'flex', alignItems: 'center', gap: '12px' }}>
+                            <div style={{ width: 44, height: 44, borderRadius: 44, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--color-accent)', color: '#fff', fontWeight: 800, fontSize: '1rem' }}>{idx + 1}</div>
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div style={{ fontWeight: 700, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name || 'Anonymous'}</div>
+                              <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>{p.phone || p.participant_id || '—'}</div>
+                            </div>
+                            <div style={{ textAlign: 'right' }}>
+                              <div style={{ fontWeight: 800, fontSize: '1.1rem' }}>{p.points}</div>
+                              <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>pts</div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <div style={{ marginTop: '0.75rem' }}>
+                      <button className="btn btn-secondary btn-sm" onClick={() => setShowRangeLeaderboard(false)}>Close</button>
+                    </div>
+                  </div>
+                )}
+
+                {showOverallLeaderboard && (
+                  <div style={{ marginTop: '1rem' }}>
+                    <h4 style={{ marginBottom: '0.5rem' }}>Overall Leaderboard</h4>
+                    {overallLeaderboard.length === 0 ? <div>No scores yet.</div> : (
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '12px' }}>
+                        {overallLeaderboard.map((p, idx) => (
+                          <div key={p.participant_id} className={`mc-option-button`} style={{ padding: '12px', display: 'flex', alignItems: 'center', gap: '12px' }}>
+                            <div style={{ width: 44, height: 44, borderRadius: 44, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--color-accent)', color: '#fff', fontWeight: 800, fontSize: '1rem' }}>{idx + 1}</div>
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div style={{ fontWeight: 700, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name || 'Anonymous'}</div>
+                              <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>{p.phone || p.participant_id || '—'}</div>
+                            </div>
+                            <div style={{ textAlign: 'right' }}>
+                              <div style={{ fontWeight: 800, fontSize: '1.1rem' }}>{p.points}</div>
+                              <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>pts</div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <div style={{ marginTop: '0.75rem' }}>
+                      <button className="btn btn-secondary btn-sm" onClick={() => setShowOverallLeaderboard(false)}>Close</button>
+                    </div>
+                  </div>
+                )}
+              </div>
 
               {/* Back/Next Controls */}
               <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '3rem', borderTop: '1px solid var(--border-color)', paddingTop: '1.5rem' }}>
@@ -814,29 +1185,44 @@ export default function HostLive() {
           </div>
 
           <div className="glass-card" style={{ padding: '1.5rem', display: 'flex', flexDirection: 'column', gap: '1rem', flex: 1 }}>
-            <h3 style={{ fontSize: '1.1rem', borderBottom: '1px solid var(--border-color)', paddingBottom: '0.5rem' }}>Questions Navigator</h3>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+              <h3 style={{ fontSize: '1.1rem', borderBottom: '1px solid var(--border-color)', paddingBottom: '0.5rem' }}>Questions Navigator</h3>
+              <input
+                type="search"
+                className="form-input"
+                placeholder="Search question, number, or options"
+                value={questionSearch}
+                onChange={(e) => setQuestionSearch(e.target.value)}
+                style={{ width: '100%' }}
+              />
+            </div>
             
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', overflowY: 'auto', maxHeight: '400px' }}>
-              {questions.map((q, idx) => {
-                const isActive = q.id === currentQuestion?.id;
-                const isPollInteractive = poll.status === 'active' || poll.status === 'ended';
-                return (
-                  <button
-                    key={q.id}
-                    className={`live-nav-btn ${isActive ? 'active' : ''}`}
-                    onClick={() => handleSetActiveQuestion(q)}
-                    disabled={!isPollInteractive}
-                    title={!isPollInteractive ? 'Start the session to navigate questions' : ''}
-                  >
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
-                      <span style={{ fontSize: '0.75rem', textTransform: 'uppercase', fontWeight: 700 }}>Question {idx + 1}</span>
-                      <span style={{ fontSize: '0.9rem', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
-                        {q.text}
-                      </span>
-                    </div>
-                  </button>
-                );
-              })}
+              {filteredQuestions.length === 0 ? (
+                <div style={{ padding: '1rem', border: '1px dashed var(--border-color)', borderRadius: '16px', color: 'var(--text-secondary)' }}>
+                  No matching questions found.
+                </div>
+              ) : (
+                filteredQuestions.map((q) => {
+                  const isActive = q.id === currentQuestion?.id;
+                  const isPollInteractive = poll.status === 'active' || poll.status === 'ended';
+                  return (
+                    <button
+                      key={q.id}
+                      className={`live-nav-btn ${isActive ? 'active' : ''}`}
+                      onClick={() => handleSetActiveQuestion(q)}
+                      disabled={!isPollInteractive}
+                      title={!isPollInteractive ? 'Start the session to navigate questions' : ''}
+                    >
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                        <span style={{ fontSize: '0.75rem', textTransform: 'uppercase', fontWeight: 700 }}>Question {q.questionNumber}</span>
+                        <span style={{ fontSize: '0.9rem', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
+                          {q.text}
+                        </span>
+                      </div>
+                    </button>
+                  );
+                }) )}
             </div>
           </div>
         </div>
@@ -845,3 +1231,5 @@ export default function HostLive() {
     </div>
   );
 }
+
+ 

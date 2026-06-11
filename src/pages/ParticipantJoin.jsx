@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { supabase } from '../supabaseClient';
-import { getParticipantSessionId, getParticipantName, setParticipantName } from '../utils';
+import { generateUUID, getParticipantSessionId, getParticipantName, setParticipantName } from '../utils';
 import { LogIn, ArrowRight } from 'lucide-react';
 
 export default function ParticipantJoin() {
@@ -10,6 +10,7 @@ export default function ParticipantJoin() {
   const sessionId = getParticipantSessionId();
 
   const [name, setName] = useState('');
+  const [phone, setPhone] = useState('');
   const [poll, setPoll] = useState(null);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
@@ -56,22 +57,52 @@ export default function ParticipantJoin() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!name.trim()) {
-      alert('Please enter your name.');
+      setError('Please enter your name.');
       return;
     }
-    
+
+    const cleanedPhone = phone.replace(/\D/g, '');
+    if (!cleanedPhone) {
+      setError('Please enter your phone number.');
+      return;
+    }
+    if (cleanedPhone.length !== 10) {
+      setError('Phone number must be exactly 10 digits.');
+      return;
+    }
+
+    const finalSessionId = sessionId || (() => {
+      const generated = generateUUID();
+      localStorage.setItem('pulsepoint_participant_session_id', generated);
+      return generated;
+    })();
+
     setSubmitting(true);
     setError('');
 
     try {
-      // Upsert participant into database
+      const { data: existingPhone, error: phoneError } = await supabase
+        .from('participants')
+        .select('id, session_id')
+        .eq('poll_id', poll.id)
+        .eq('phone', cleanedPhone)
+        .maybeSingle();
+
+      if (phoneError) throw phoneError;
+      if (existingPhone && existingPhone.session_id !== finalSessionId) {
+        setError('This phone number is already registered for this event.');
+        setSubmitting(false);
+        return;
+      }
+
       const { data: participant, error: pError } = await supabase
         .from('participants')
         .upsert(
           {
             poll_id: poll.id,
             name: name.trim(),
-            session_id: sessionId
+            phone: cleanedPhone,
+            session_id: finalSessionId
           },
           { onConflict: 'poll_id,session_id' }
         )
@@ -80,10 +111,7 @@ export default function ParticipantJoin() {
 
       if (pError) throw pError;
 
-      // Save name in local storage
       setParticipantName(poll.id, name.trim());
-
-      // Navigate to polling page
       navigate(`/poll/${code}/play`);
     } catch (err) {
       console.error(err);
@@ -125,13 +153,38 @@ export default function ParticipantJoin() {
                 placeholder="e.g. Alice, Bob Smith"
                 maxLength={40}
                 value={name}
-                onChange={(e) => setName(e.target.value)}
+                onChange={(e) => {
+                  setName(e.target.value);
+                  if (error) setError('');
+                }}
                 disabled={submitting}
                 required
                 autoFocus
               />
               <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
                 Your name will be visible to the presenter. No signup or email is collected.
+              </p>
+            </div>
+
+            <div className="form-group">
+              <label className="form-label">Phone Number</label>
+              <input
+                type="tel"
+                className="form-input"
+                placeholder="Enter 10-digit phone number"
+                value={phone}
+                onChange={(e) => {
+                  const digits = e.target.value.replace(/\D/g, '');
+                  setPhone(digits.slice(0, 10));
+                  if (error) setError('');
+                }}
+                disabled={submitting}
+                inputMode="numeric"
+                maxLength={10}
+                required
+              />
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
+                Enter digits only, maximum 10 characters.
               </p>
             </div>
 

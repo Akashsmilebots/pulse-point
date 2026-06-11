@@ -352,6 +352,47 @@ p {
   }
 }
 
+/* Mobile: show only join card for simpler join flow */
+@media (max-width: 600px) {
+  .hero-text {
+    display: none;
+  }
+  .landing-grid {
+    grid-template-columns: 1fr;
+    padding: 1rem;
+  }
+  .join-card {
+    margin: 1.5rem auto;
+    width: 100%;
+    max-width: 420px;
+    padding: 1.5rem;
+  }
+  .join-code-input {
+    font-size: 1.6rem;
+    padding: 0.5rem 0.75rem;
+  }
+}
+
+@media (max-width: 420px) {
+  .join-card {
+    max-width: calc(100% - 2rem);
+    padding: 1rem;
+    border-radius: var(--radius-md);
+  }
+  .join-code-input {
+    font-size: 1.4rem;
+  }
+}
+
+@media (max-width: 360px) {
+  .join-card {
+    padding: 0.75rem;
+  }
+  .join-code-input {
+    font-size: 1.2rem;
+  }
+}
+
 .hero-text h1 {
   font-size: 3.5rem;
   line-height: 1.1;
