@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { supabase } from '../supabaseClient';
 import { getHostId } from '../utils';
-import { ArrowLeft, Play, Square, RefreshCw, Users, AlertCircle, Copy, Check, MessageSquare, Star, BarChart3, ChevronRight, ChevronLeft } from 'lucide-react';
+import { ArrowLeft, Play, Square, RefreshCw, Users, AlertCircle, Copy, Check, ChevronRight, ChevronLeft, Plus, Save } from 'lucide-react';
 
 export default function HostLive() {
   const { id } = useParams();
@@ -16,6 +16,10 @@ export default function HostLive() {
   const [participantCount, setParticipantCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [copied, setCopied] = useState(false);
+  const [draftTitle, setDraftTitle] = useState('');
+  const [savingDraft, setSavingDraft] = useState(false);
+  const [saveMessage, setSaveMessage] = useState('');
+  const [errorMessage, setErrorMessage] = useState('');
 
   // Keep a ref to the active question ID for the realtime channel callback
   const activeQuestionIdRef = useRef(null);
@@ -89,12 +93,13 @@ export default function HostLive() {
 
       if (pollError || !pollData) {
         console.error('Error fetching poll:', pollError);
-        alert('Poll not found or unauthorized.');
+        setErrorMessage('Poll not found or unauthorized.');
         navigate('/dashboard');
         return;
       }
 
       setPoll(pollData);
+      setDraftTitle(pollData.title || '');
 
       // Fetch questions
       const { data: qData, error: qError } = await supabase
@@ -116,7 +121,7 @@ export default function HostLive() {
       }
     } catch (err) {
       console.error(err);
-      alert('Failed to load host control screen.');
+      setErrorMessage('Failed to load host control screen.');
     } finally {
       setLoading(false);
     }
@@ -135,6 +140,136 @@ export default function HostLive() {
       }
     } catch (err) {
       console.error('Error getting participant count:', err);
+    }
+  };
+
+  const handleAddQuestion = () => {
+    setQuestions([
+      ...questions,
+      { text: '', type: 'multiple_choice', options: ['Option 1', 'Option 2'] }
+    ]);
+  };
+
+  const handleRemoveQuestion = (index) => {
+    setQuestions(questions.filter((_, idx) => idx !== index));
+  };
+
+  const handleQuestionTextChange = (index, value) => {
+    const updated = [...questions];
+    updated[index].text = value;
+    setQuestions(updated);
+  };
+
+  const handleQuestionTypeChange = (index, type) => {
+    const updated = [...questions];
+    updated[index].type = type;
+    if (type === 'multiple_choice' && (!updated[index].options || updated[index].options.length === 0)) {
+      updated[index].options = ['Option 1', 'Option 2'];
+    }
+    if (type !== 'multiple_choice') {
+      updated[index].options = [];
+    }
+    setQuestions(updated);
+  };
+
+  const handleOptionChange = (qIndex, oIndex, value) => {
+    const updated = [...questions];
+    updated[qIndex].options[oIndex] = value;
+    setQuestions(updated);
+  };
+
+  const handleAddOption = (qIndex) => {
+    const updated = [...questions];
+    updated[qIndex].options.push(`Option ${updated[qIndex].options.length + 1}`);
+    setQuestions(updated);
+  };
+
+  const handleRemoveOption = (qIndex, oIndex) => {
+    const updated = [...questions];
+    if (updated[qIndex].options.length <= 2) {
+      setErrorMessage('Multiple choice questions need at least 2 options.');
+      return;
+    }
+    updated[qIndex].options = updated[qIndex].options.filter((_, idx) => idx !== oIndex);
+    setQuestions(updated);
+  };
+
+  const handleMoveQuestion = (index, direction) => {
+    if (direction === 'up' && index === 0) return;
+    if (direction === 'down' && index === questions.length - 1) return;
+
+    const updated = [...questions];
+    const swapIndex = direction === 'up' ? index - 1 : index + 1;
+    [updated[index], updated[swapIndex]] = [updated[swapIndex], updated[index]];
+    setQuestions(updated);
+  };
+
+  const handleSaveDraft = async () => {
+    if (!poll) return false;
+    setErrorMessage('');
+
+    if (!draftTitle.trim()) {
+      setErrorMessage('Please enter an event title.');
+      return false;
+    }
+
+    for (let i = 0; i < questions.length; i++) {
+      if (!questions[i].text.trim()) {
+        setErrorMessage(`Question ${i + 1} has no text. Please fill it in.`);
+        return false;
+      }
+      if (questions[i].type === 'multiple_choice') {
+        for (let j = 0; j < questions[i].options.length; j++) {
+          if (!questions[i].options[j].trim()) {
+            setErrorMessage(`Option ${j + 1} in Question ${i + 1} is empty.`);
+            return false;
+          }
+        }
+      }
+    }
+
+    setSavingDraft(true);
+    try {
+      const { error: pollError } = await supabase
+        .from('polls')
+        .update({ title: draftTitle.trim() })
+        .eq('id', poll.id)
+        .eq('host_id', hostId);
+      if (pollError) throw pollError;
+
+      const { error: deleteError } = await supabase
+        .from('questions')
+        .delete()
+        .eq('poll_id', poll.id);
+      if (deleteError) throw deleteError;
+
+      if (questions.length > 0) {
+        const questionsToInsert = questions.map((q, idx) => ({
+          poll_id: poll.id,
+          text: q.text.trim(),
+          type: q.type,
+          options: q.type === 'multiple_choice' ? q.options.map((o) => o.trim()) : [],
+          order_index: idx
+        }));
+
+        const { error: insertError } = await supabase
+          .from('questions')
+          .insert(questionsToInsert);
+
+        if (insertError) throw insertError;
+      }
+
+      setPoll({ ...poll, title: draftTitle.trim() });
+      setSaveMessage('Draft saved successfully.');
+      setTimeout(() => setSaveMessage(''), 3000);
+      await fetchPollAndQuestions();
+      return true;
+    } catch (err) {
+      console.error(err);
+      setErrorMessage('Error saving draft changes.');
+      return false;
+    } finally {
+      setSavingDraft(false);
     }
   };
 
@@ -160,12 +295,29 @@ export default function HostLive() {
   };
 
   const handleStartPoll = async () => {
+    setErrorMessage('');
     if (questions.length === 0) {
-      alert('You must add questions to your poll before launching it.');
+      setErrorMessage('You must add questions to your poll before launching it.');
       return;
     }
+
+    const saved = await handleSaveDraft();
+    if (!saved) return;
+
     try {
-      const firstQ = questions[0];
+      const { data: firstQ, error: firstQError } = await supabase
+        .from('questions')
+        .select('*')
+        .eq('poll_id', poll.id)
+        .order('order_index', { ascending: true })
+        .limit(1)
+        .single();
+
+      if (firstQError || !firstQ) {
+        setErrorMessage('Unable to find the first question after saving the draft.');
+        return;
+      }
+
       const { error } = await supabase
         .from('polls')
         .update({
@@ -179,7 +331,7 @@ export default function HostLive() {
       setCurrentQuestion(firstQ);
     } catch (err) {
       console.error(err);
-      alert('Failed to start poll.');
+      setErrorMessage('Failed to start poll. Please try again.');
     }
   };
 
@@ -195,10 +347,10 @@ export default function HostLive() {
 
       if (error) throw error;
       setPoll({ ...poll, status: 'ended', current_question_id: null });
-      setCurrentQuestion(null);
+      setCurrentQuestion(currentQuestion || questions[0] || null);
     } catch (err) {
       console.error(err);
-      alert('Failed to end poll.');
+      setErrorMessage('Failed to end poll.');
     }
   };
 
@@ -236,14 +388,14 @@ export default function HostLive() {
       setResponses([]);
     } catch (err) {
       console.error(err);
-      alert('Failed to reset poll.');
+      setErrorMessage('Failed to reset poll.');
     } finally {
       setLoading(false);
     }
   };
 
   const handleSetActiveQuestion = async (q) => {
-    if (poll.status !== 'active') return;
+    if (!(poll.status === 'active' || poll.status === 'ended')) return;
     try {
       const { error } = await supabase
         .from('polls')
@@ -255,7 +407,7 @@ export default function HostLive() {
       setCurrentQuestion(q);
     } catch (err) {
       console.error(err);
-      alert('Failed to change active question.');
+      setErrorMessage('Failed to change active question.');
     }
   };
 
@@ -267,6 +419,7 @@ export default function HostLive() {
   };
 
   const handlePrevQuestion = () => {
+    if (!currentQuestion) return;
     const currentIndex = questions.findIndex(q => q.id === currentQuestion.id);
     if (currentIndex > 0) {
       handleSetActiveQuestion(questions[currentIndex - 1]);
@@ -408,7 +561,12 @@ export default function HostLive() {
         </button>
         <div style={{ display: 'flex', gap: '0.75rem' }}>
           {poll.status === 'draft' && (
-            <button className="btn btn-success" onClick={handleStartPoll}>
+            <button className="btn btn-secondary" onClick={handleSaveDraft} disabled={savingDraft || loading}>
+              <Save size={16} /> Save Draft
+            </button>
+          )}
+          {poll.status === 'draft' && (
+            <button className="btn btn-success" onClick={handleStartPoll} disabled={questions.length === 0 || savingDraft || loading}>
               <Play size={16} /> Start Poll Session
             </button>
           )}
@@ -424,6 +582,12 @@ export default function HostLive() {
           )}
         </div>
       </div>
+
+      {errorMessage && (
+        <div style={{ margin: '0 0 1rem 0', padding: '1rem 1.25rem', borderRadius: '16px', background: 'rgba(248, 113, 113, 0.1)', color: 'var(--color-danger)', border: '1px solid rgba(248, 113, 113, 0.25)' }}>
+          {errorMessage}
+        </div>
+      )}
 
       {/* Join Info Banner */}
       <div className="join-banner">
@@ -448,25 +612,153 @@ export default function HostLive() {
         {/* Main projection pane */}
         <div className="glass-card" style={{ padding: '2.5rem' }}>
           {poll.status === 'draft' ? (
-            <div style={{ textAlign: 'center', padding: '3rem 1rem' }}>
-              <AlertCircle size={48} color="var(--color-primary)" style={{ marginBottom: '1.5rem' }} />
-              <h2>Poll is in Draft State</h2>
-              <p style={{ maxWidth: '400px', margin: '0 auto 2rem auto' }}>
-                Your presentation screen will update once you click "Start Poll Session" at the top right.
-              </p>
-              <button className="btn btn-primary" onClick={handleStartPoll}>
-                <Play size={16} /> Start Session Now
-              </button>
-            </div>
-          ) : poll.status === 'ended' ? (
-            <div style={{ textAlign: 'center', padding: '3rem 1rem' }}>
-              <Check size={48} color="var(--color-success)" style={{ marginBottom: '1.5rem' }} />
-              <h2>This session has ended!</h2>
-              <p style={{ maxWidth: '400px', margin: '0 auto 2rem auto' }}>
-                Audience members can no longer submit responses. You can click "Reset & Restart" to clear data and run it again.
-              </p>
+            <div>
+              <div style={{ marginBottom: '1.5rem' }}>
+                <h2>Edit Event Title & Questions</h2>
+                <p style={{ margin: '0.5rem 0 0', color: 'var(--text-secondary)' }}>
+                  Add questions now, save the draft, and start the live session when you're ready. You can edit questions individually before launch.
+                </p>
+              </div>
+
+              <div className="form-group">
+                <label className="form-label">Event Title</label>
+                <input
+                  type="text"
+                  className="form-input"
+                  placeholder="e.g. Weekly All-Hands Feedback"
+                  value={draftTitle}
+                  onChange={(e) => setDraftTitle(e.target.value)}
+                  disabled={savingDraft || loading}
+                />
+              </div>
+
+              {saveMessage && (
+                <div style={{ marginBottom: '1rem', color: 'var(--color-success)', fontWeight: 600 }}>
+                  {saveMessage}
+                </div>
+              )}
+
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', margin: '2rem 0 1rem 0' }}>
+                <h3 style={{ margin: 0 }}>Questions</h3>
+                <button className="btn btn-secondary btn-sm" onClick={handleAddQuestion} disabled={savingDraft || loading}>
+                  <Plus size={14} /> Add Question
+                </button>
+              </div>
+
+              {questions.length === 0 ? (
+                <div style={{ padding: '1.5rem', border: '1px dashed var(--border-color)', borderRadius: '16px', color: 'var(--text-secondary)' }}>
+                  No questions yet. Add your first question and save the draft.
+                </div>
+              ) : (
+                <div style={{ display: 'grid', gap: '1rem' }}>
+                  {questions.map((q, idx) => (
+                    <div className="question-card" key={idx} style={{ padding: '1.25rem', borderRadius: '18px', border: '1px solid var(--border-color)' }}>
+                      <div className="question-card-header">
+                        <span className="question-number">Question {idx + 1}</span>
+                        <div style={{ display: 'flex', gap: '0.5rem' }}>
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-sm"
+                            onClick={() => handleMoveQuestion(idx, 'up')}
+                            disabled={idx === 0 || savingDraft || loading}
+                            style={{ padding: '0.25rem 0.5rem' }}
+                          >
+                            <ChevronLeft size={14} />
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-sm"
+                            onClick={() => handleMoveQuestion(idx, 'down')}
+                            disabled={idx === questions.length - 1 || savingDraft || loading}
+                            style={{ padding: '0.25rem 0.5rem' }}
+                          >
+                            <ChevronRight size={14} />
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-danger btn-sm"
+                            onClick={() => handleRemoveQuestion(idx)}
+                            disabled={savingDraft || loading}
+                            style={{ padding: '0.25rem 0.5rem' }}
+                          >
+                            <Square size={14} />
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="form-group">
+                        <label className="form-label">Question Text</label>
+                        <input
+                          type="text"
+                          className="form-input"
+                          placeholder="Enter your question"
+                          value={q.text}
+                          onChange={(e) => handleQuestionTextChange(idx, e.target.value)}
+                          disabled={savingDraft || loading}
+                        />
+                      </div>
+
+                      <div className="form-group">
+                        <label className="form-label">Question Type</label>
+                        <select
+                          className="form-select"
+                          value={q.type}
+                          onChange={(e) => handleQuestionTypeChange(idx, e.target.value)}
+                          disabled={savingDraft || loading}
+                        >
+                          <option value="multiple_choice">Multiple Choice</option>
+                          <option value="open_text">Open Text</option>
+                          <option value="rating">Rating</option>
+                        </select>
+                      </div>
+
+                      {q.type === 'multiple_choice' && (
+                        <div className="question-options-editor">
+                          <label className="form-label" style={{ fontSize: '0.85rem' }}>Options</label>
+                          {q.options.map((option, oIndex) => (
+                            <div className="option-row" key={oIndex}>
+                              <input
+                                type="text"
+                                className="form-input"
+                                style={{ flex: 1, padding: '0.5rem 0.75rem', fontSize: '0.9rem' }}
+                                value={option}
+                                onChange={(e) => handleOptionChange(idx, oIndex, e.target.value)}
+                                disabled={savingDraft || loading}
+                              />
+                              <button
+                                type="button"
+                                className="btn btn-danger btn-sm"
+                                onClick={() => handleRemoveOption(idx, oIndex)}
+                                disabled={savingDraft || loading}
+                                style={{ padding: '0.5rem' }}
+                              >
+                                <Square size={14} />
+                              </button>
+                            </div>
+                          ))}
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-sm"
+                            style={{ width: 'fit-content', marginTop: '0.5rem' }}
+                            onClick={() => handleAddOption(idx)}
+                            disabled={savingDraft || loading}
+                          >
+                            <Plus size={12} /> Add Option
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           ) : currentQuestion ? (
+            <div>
+              {poll.status === 'ended' && (
+                <div style={{ marginBottom: '1.5rem', padding: '1rem 1.25rem', borderRadius: '16px', background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.2)', color: 'var(--color-success)' }}>
+                  <strong>Session ended.</strong> You can still review responses for any question below.
+                </div>
+              )}
             <div>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--border-color)', paddingBottom: '1rem', marginBottom: '2rem' }}>
                 <div>
@@ -489,18 +781,19 @@ export default function HostLive() {
                 <button 
                   className="btn btn-secondary" 
                   onClick={handlePrevQuestion} 
-                  disabled={currentIndex === 0}
+                  disabled={!currentQuestion || questions.length <= 1 || currentIndex === 0}
                 >
                   <ChevronLeft size={16} /> Previous Question
                 </button>
                 <button 
                   className="btn btn-secondary" 
                   onClick={handleNextQuestion} 
-                  disabled={currentIndex === questions.length - 1}
+                  disabled={!currentQuestion || questions.length <= 1 || currentIndex === questions.length - 1}
                 >
                   Next Question <ChevronRight size={16} />
                 </button>
               </div>
+           </div>
             </div>
           ) : (
             <div style={{ textAlign: 'center', padding: '3rem 0' }}>
@@ -526,14 +819,14 @@ export default function HostLive() {
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', overflowY: 'auto', maxHeight: '400px' }}>
               {questions.map((q, idx) => {
                 const isActive = q.id === currentQuestion?.id;
-                const isPollActive = poll.status === 'active';
+                const isPollInteractive = poll.status === 'active' || poll.status === 'ended';
                 return (
                   <button
                     key={q.id}
                     className={`live-nav-btn ${isActive ? 'active' : ''}`}
                     onClick={() => handleSetActiveQuestion(q)}
-                    disabled={!isPollActive}
-                    title={!isPollActive ? 'Start the session to navigate questions' : ''}
+                    disabled={!isPollInteractive}
+                    title={!isPollInteractive ? 'Start the session to navigate questions' : ''}
                   >
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
                       <span style={{ fontSize: '0.75rem', textTransform: 'uppercase', fontWeight: 700 }}>Question {idx + 1}</span>

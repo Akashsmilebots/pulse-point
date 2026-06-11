@@ -153,6 +153,42 @@ export default function ParticipantPlay() {
     }
   };
 
+  const refreshPollState = async () => {
+    if (!poll?.id) return;
+    try {
+      const { data: latestPoll, error: pollError } = await supabase
+        .from('polls')
+        .select('*')
+        .eq('id', poll.id)
+        .single();
+
+      if (pollError || !latestPoll) return;
+      setPoll(latestPoll);
+
+      if (latestPoll.status === 'ended') {
+        setCurrentQuestion(null);
+        setUserResponse(null);
+        return;
+      }
+
+      if (latestPoll.current_question_id && latestPoll.current_question_id !== currentQuestionIdRef.current) {
+        await fetchQuestion(latestPoll.current_question_id);
+      }
+    } catch (err) {
+      console.error('Error refreshing poll state:', err);
+    }
+  };
+
+  useEffect(() => {
+    if (!poll?.id || poll.status !== 'active') return;
+
+    const interval = setInterval(() => {
+      refreshPollState();
+    }, 8000);
+
+    return () => clearInterval(interval);
+  }, [poll?.id, poll?.status]);
+
   const handleSubmitAnswer = async (e) => {
     if (e) e.preventDefault();
     if (!currentQuestion || !participant) return;
@@ -257,6 +293,9 @@ export default function ParticipantPlay() {
           <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
             This screen will update automatically.
           </p>
+          <button className="btn btn-secondary" onClick={refreshPollState} style={{ marginTop: '1rem' }}>
+            Refresh Now
+          </button>
         </div>
       </div>
     );
@@ -279,6 +318,9 @@ export default function ParticipantPlay() {
               Hold tight. The host will switch to the next question shortly!
             </p>
           </div>
+          <button className="btn btn-secondary" onClick={refreshPollState} style={{ marginTop: '1rem' }}>
+            Check for Next Question
+          </button>
         </div>
       </div>
     );

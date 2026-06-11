@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { supabase } from '../supabaseClient';
 import { getHostId, generateJoinCode } from '../utils';
-import { ArrowLeft, Plus, Trash2, ChevronUp, ChevronDown, Save } from 'lucide-react';
+import { ArrowLeft, Save } from 'lucide-react';
 
 export default function PollForm() {
   const { id } = useParams(); // undefined if creating
@@ -11,9 +11,6 @@ export default function PollForm() {
   const isEdit = !!id;
 
   const [title, setTitle] = useState('');
-  const [questions, setQuestions] = useState([
-    { text: '', type: 'multiple_choice', options: ['Option 1', 'Option 2'] }
-  ]);
   const [loading, setLoading] = useState(false);
   const [fetching, setFetching] = useState(isEdit);
 
@@ -41,26 +38,6 @@ export default function PollForm() {
       }
 
       setTitle(poll.title);
-
-      // Fetch poll questions ordered by order_index
-      const { data: questionsData, error: qError } = await supabase
-        .from('questions')
-        .select('*')
-        .eq('poll_id', id)
-        .order('order_index', { ascending: true });
-
-      if (qError) throw qError;
-
-      if (questionsData && questionsData.length > 0) {
-        setQuestions(
-          questionsData.map((q) => ({
-            id: q.id,
-            text: q.text,
-            type: q.type,
-            options: q.options || []
-          }))
-        );
-      }
     } catch (err) {
       console.error(err);
       alert('Failed to load poll details.');
@@ -69,90 +46,11 @@ export default function PollForm() {
     }
   };
 
-  const handleAddQuestion = () => {
-    setQuestions([
-      ...questions,
-      { text: '', type: 'multiple_choice', options: ['Option 1', 'Option 2'] }
-    ]);
-  };
-
-  const handleRemoveQuestion = (index) => {
-    if (questions.length === 1) {
-      alert('Your poll must have at least one question.');
-      return;
-    }
-    setQuestions(questions.filter((_, idx) => idx !== index));
-  };
-
-  const handleQuestionTextChange = (index, val) => {
-    const updated = [...questions];
-    updated[index].text = val;
-    setQuestions(updated);
-  };
-
-  const handleQuestionTypeChange = (index, type) => {
-    const updated = [...questions];
-    updated[index].type = type;
-    if (type === 'multiple_choice' && (!updated[index].options || updated[index].options.length === 0)) {
-      updated[index].options = ['Option 1', 'Option 2'];
-    }
-    setQuestions(updated);
-  };
-
-  const handleOptionChange = (qIndex, oIndex, val) => {
-    const updated = [...questions];
-    updated[qIndex].options[oIndex] = val;
-    setQuestions(updated);
-  };
-
-  const handleAddOption = (qIndex) => {
-    const updated = [...questions];
-    updated[qIndex].options.push(`Option ${updated[qIndex].options.length + 1}`);
-    setQuestions(updated);
-  };
-
-  const handleRemoveOption = (qIndex, oIndex) => {
-    const updated = [...questions];
-    if (updated[qIndex].options.length <= 2) {
-      alert('Multiple choice questions need at least 2 options.');
-      return;
-    }
-    updated[qIndex].options = updated[qIndex].options.filter((_, idx) => idx !== oIndex);
-    setQuestions(updated);
-  };
-
-  const handleMoveQuestion = (index, direction) => {
-    if (direction === 'up' && index === 0) return;
-    if (direction === 'down' && index === questions.length - 1) return;
-
-    const newIndex = direction === 'up' ? index - 1 : index + 1;
-    const updated = [...questions];
-    const temp = updated[index];
-    updated[index] = updated[newIndex];
-    updated[newIndex] = temp;
-    setQuestions(updated);
-  };
-
   const handleSave = async (e) => {
     e.preventDefault();
     if (!title.trim()) {
       alert('Please enter a poll title.');
       return;
-    }
-
-    for (let i = 0; i < questions.length; i++) {
-      if (!questions[i].text.trim()) {
-        alert(`Question ${i + 1} has no text. Please fill it in.`);
-        return;
-      }
-      if (questions[i].type === 'multiple_choice') {
-        for (let j = 0; j < questions[i].options.length; j++) {
-          if (!questions[i].options[j].trim()) {
-            alert(`Option ${j + 1} in Question ${i + 1} is empty.`);
-            return;
-          }
-        }
-      }
     }
 
     setLoading(true);
@@ -164,7 +62,7 @@ export default function PollForm() {
         // Generate unique 6 digit code
         let uniqueCode = '';
         let exists = true;
-        
+
         while (exists) {
           uniqueCode = generateJoinCode();
           const { data } = await supabase
@@ -175,7 +73,6 @@ export default function PollForm() {
           if (!data) exists = false;
         }
 
-        // Insert new poll
         const { data: newPoll, error: pollError } = await supabase
           .from('polls')
           .insert({
@@ -190,7 +87,6 @@ export default function PollForm() {
         if (pollError) throw pollError;
         pollId = newPoll.id;
       } else {
-        // Update poll title
         const { error: pollError } = await supabase
           .from('polls')
           .update({ title: title.trim() })
@@ -200,35 +96,10 @@ export default function PollForm() {
         if (pollError) throw pollError;
       }
 
-      // Handle Questions (simple approach: delete existing if edit, and re-insert)
-      if (isEdit) {
-        const { error: deleteError } = await supabase
-          .from('questions')
-          .delete()
-          .eq('poll_id', pollId);
-
-        if (deleteError) throw deleteError;
-      }
-
-      // Insert questions
-      const questionsToInsert = questions.map((q, idx) => ({
-        poll_id: pollId,
-        text: q.text.trim(),
-        type: q.type,
-        options: q.type === 'multiple_choice' ? q.options.map((o) => o.trim()) : [],
-        order_index: idx
-      }));
-
-      const { error: insertError } = await supabase
-        .from('questions')
-        .insert(questionsToInsert);
-
-      if (insertError) throw insertError;
-
-      navigate('/dashboard');
+      navigate(`/polls/${pollId}/host`);
     } catch (err) {
       console.error(err);
-      alert('Error saving poll details.');
+      alert('Error saving poll title.');
     } finally {
       setLoading(false);
     }
@@ -264,118 +135,17 @@ export default function PollForm() {
           />
         </div>
 
-        <div style={{ marginTop: '2.5rem' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--border-color)', paddingBottom: '0.75rem', marginBottom: '1.5rem' }}>
-            <h2>Questions</h2>
-            <button type="button" className="btn btn-secondary btn-sm" onClick={handleAddQuestion} disabled={loading}>
-              <Plus size={14} /> Add Question
-            </button>
-          </div>
-
-          <div className="questions-list">
-            {questions.map((q, qIndex) => (
-              <div className="question-card" key={qIndex}>
-                <div className="question-card-header">
-                  <span className="question-number">Question {qIndex + 1}</span>
-                  <div style={{ display: 'flex', gap: '0.25rem' }}>
-                    <button
-                      type="button"
-                      className="btn btn-secondary btn-sm"
-                      onClick={() => handleMoveQuestion(qIndex, 'up')}
-                      disabled={qIndex === 0 || loading}
-                      style={{ padding: '0.25rem 0.5rem' }}
-                    >
-                      <ChevronUp size={14} />
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn-secondary btn-sm"
-                      onClick={() => handleMoveQuestion(qIndex, 'down')}
-                      disabled={qIndex === questions.length - 1 || loading}
-                      style={{ padding: '0.25rem 0.5rem' }}
-                    >
-                      <ChevronDown size={14} />
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn-danger btn-sm"
-                      onClick={() => handleRemoveQuestion(qIndex)}
-                      disabled={loading}
-                      style={{ padding: '0.25rem 0.5rem' }}
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  </div>
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label">Question Text</label>
-                  <input
-                    type="text"
-                    className="form-input"
-                    placeholder="Enter your question here"
-                    value={q.text}
-                    onChange={(e) => handleQuestionTextChange(qIndex, e.target.value)}
-                    disabled={loading}
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label">Question Type</label>
-                  <select
-                    className="form-select"
-                    value={q.type}
-                    onChange={(e) => handleQuestionTypeChange(qIndex, e.target.value)}
-                    disabled={loading}
-                  >
-                    <option value="multiple_choice">Multiple Choice</option>
-                    <option value="open_text">Open Ended Text</option>
-                    <option value="rating">Rating (1-5 stars)</option>
-                  </select>
-                </div>
-
-                {q.type === 'multiple_choice' && (
-                  <div className="question-options-editor">
-                    <label className="form-label" style={{ fontSize: '0.85rem' }}>Options</label>
-                    {q.options.map((option, oIndex) => (
-                      <div className="option-row" key={oIndex}>
-                        <input
-                          type="text"
-                          className="form-input"
-                          style={{ flex: 1, padding: '0.5rem 0.75rem', fontSize: '0.9rem' }}
-                          value={option}
-                          onChange={(e) => handleOptionChange(qIndex, oIndex, e.target.value)}
-                          disabled={loading}
-                        />
-                        <button
-                          type="button"
-                          className="btn btn-danger btn-sm"
-                          onClick={() => handleRemoveOption(qIndex, oIndex)}
-                          disabled={loading}
-                          style={{ padding: '0.5rem' }}
-                        >
-                          <Trash2 size={14} />
-                        </button>
-                      </div>
-                    ))}
-                    <button
-                      type="button"
-                      className="btn btn-secondary btn-sm"
-                      style={{ width: 'fit-content', marginTop: '0.5rem' }}
-                      onClick={() => handleAddOption(qIndex)}
-                      disabled={loading}
-                    >
-                      <Plus size={12} /> Add Option
-                    </button>
-                  </div>
-                )}
-              </div>
-            ))}
+        <div style={{ marginTop: '2rem' }}>
+          <div style={{ background: 'rgba(255,255,255,0.03)', padding: '1.5rem', borderRadius: '18px', border: '1px solid var(--border-color)', marginBottom: '1.5rem' }}>
+            <h2 style={{ marginTop: 0 }}>Create the Event First</h2>
+            <p style={{ margin: 0, color: 'var(--text-secondary)' }}>
+              Enter your poll or event title here. After saving, you can add questions and manage the session on the host screen.
+            </p>
           </div>
         </div>
 
-        <button type="submit" className="btn btn-primary" style={{ width: '100%', marginTop: '3rem' }} disabled={loading}>
-          {loading ? <div className="spinner"></div> : <><Save size={18} /> Save Poll</>}
+        <button type="submit" className="btn btn-primary" style={{ width: '100%', marginTop: '1rem' }} disabled={loading}>
+          {loading ? <div className="spinner"></div> : <><Save size={18} /> {isEdit ? 'Save Title and Continue' : 'Create Event and Add Questions'}</>}
         </button>
       </form>
     </div>

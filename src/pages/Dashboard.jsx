@@ -172,8 +172,8 @@ export default function Dashboard() {
                   {isMyPoll && (
                     <button
                       className="btn btn-sm btn-secondary"
-                      onClick={() => navigate(`/polls/${poll.id}/edit`)}
-                      title="Edit Poll"
+                      onClick={() => navigate(`/polls/${poll.id}/host`)}
+                      title="Edit Event"
                     >
                       <Edit3 size={14} />
                     </button>
