@@ -22,6 +22,9 @@ export default function ParticipantPlay() {
   const [error, setError] = useState('');
   const [localCountdown, setLocalCountdown] = useState(0);
   const localTimerRef = useRef(null);
+  const userResponseRef = useRef(null);
+  const submittingRef = useRef(false);
+  const currentQuestionRef = useRef(null);
 
   const currentQuestionIdRef = useRef(null);
 
@@ -161,8 +164,8 @@ export default function ParticipantPlay() {
       setSelectionError('');
       setSelectedRating(0);
 
-      // Start local countdown for this question (20s)
-      setLocalCountdown(20);
+      // Start local countdown for this question (30s)
+      setLocalCountdown(30);
       if (localTimerRef.current) {
         clearInterval(localTimerRef.current);
       }
@@ -171,6 +174,9 @@ export default function ParticipantPlay() {
           if (prev <= 1) {
             clearInterval(localTimerRef.current);
             localTimerRef.current = null;
+            if (!userResponseRef.current && !submittingRef.current) {
+              handleSubmitAnswer(null);
+            }
             return 0;
           }
           return prev - 1;
@@ -188,8 +194,14 @@ export default function ParticipantPlay() {
 
         if (!rError && existingResponse) {
           setUserResponse(existingResponse);
+          userResponseRef.current = existingResponse;
+          if (localTimerRef.current) {
+            clearInterval(localTimerRef.current);
+            localTimerRef.current = null;
+          }
         } else {
           setUserResponse(null);
+          userResponseRef.current = null;
         }
       }
     } catch (err) {
@@ -237,33 +249,38 @@ export default function ParticipantPlay() {
     if (e) e.preventDefault();
     if (!currentQuestion || !participant) return;
 
-    if (localCountdown === 0) {
-      setSelectionError('Time is up for this question.');
-      return;
-    }
-
     let answerText = '';
+    const isAutoSubmit = e === null;
+
     if (currentQuestion.type === 'multiple_choice') {
-      if (!selectedOptions.length) {
-        setSelectionError('Please select at least one option.');
-        return;
-      }
-      answerText = selectedOptions.join(', ');
+      // Auto-submit with selected options (or empty if none selected)
+      answerText = selectedOptions.length > 0 ? selectedOptions.join(', ') : '';
     } else if (currentQuestion.type === 'rating') {
-      if (selectedRating === 0) {
-        alert('Please choose a rating.');
-        return;
-      }
-      answerText = selectedRating.toString();
+      // Auto-submit with selected rating (or empty if none selected)
+      answerText = selectedRating > 0 ? selectedRating.toString() : '';
     } else if (currentQuestion.type === 'open_text') {
-      if (!answerInput.trim()) {
-        alert('Please type an answer.');
-        return;
-      }
+      // Auto-submit with typed answer (or empty if nothing typed)
       answerText = answerInput.trim();
     }
 
+    // Only show errors if manually submitted (not auto-submit)
+    if (!isAutoSubmit) {
+      if (currentQuestion.type === 'multiple_choice' && !selectedOptions.length) {
+        setSelectionError('Please select at least one option.');
+        return;
+      }
+      if (currentQuestion.type === 'rating' && selectedRating === 0) {
+        setSelectionError('Please choose a rating.');
+        return;
+      }
+      if (currentQuestion.type === 'open_text' && !answerInput.trim()) {
+        setSelectionError('Please type an answer.');
+        return;
+      }
+    }
+
     setSubmitting(true);
+    submittingRef.current = true;
 
     try {
       // Insert response into Supabase
@@ -280,11 +297,17 @@ export default function ParticipantPlay() {
       if (error) throw error;
 
       setUserResponse(data);
+      userResponseRef.current = data;
+      if (localTimerRef.current) {
+        clearInterval(localTimerRef.current);
+        localTimerRef.current = null;
+      }
     } catch (err) {
       console.error('Error submitting response:', err);
       alert('Could not submit response. (Make sure you only vote once!)');
     } finally {
       setSubmitting(false);
+      submittingRef.current = false;
     }
   };
 

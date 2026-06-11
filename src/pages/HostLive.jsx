@@ -407,7 +407,7 @@ export default function HostLive() {
     setShowOverallLeaderboard(true);
   };
 
-  // When current question moves and it's the 10th, 20th, etc., show range leaderboard
+  // When current question moves and it's the 10th, 20th, etc., show range leaderboard and save it
   useEffect(() => {
     if (!currentQuestion || questions.length === 0) return;
     const idx = questions.findIndex(q => q.id === currentQuestion.id);
@@ -416,6 +416,8 @@ export default function HostLive() {
     if (qNumber % 10 === 0) {
       const start = Math.floor(idx / 10) * 10;
       showLeaderboardForRange(start);
+      // Save this range leaderboard to Supabase
+      saveLeaderboardRange(start, start + 10);
     }
   }, [currentQuestion?.id]);
 
@@ -468,13 +470,130 @@ export default function HostLive() {
     }
   };
 
-  const startQuestionTimer = (seconds = 20) => {
+  // Save top 10 responses for a question to Supabase
+  const saveTop10ResponsesForQuestion = async (questionId) => {
+    try {
+      const { data, error } = await supabase
+        .from('responses')
+        .select(`id, answer, question_id, participant_id, participants (id, name, phone)`)
+        .eq('question_id', questionId);
+
+      if (error) throw error;
+
+      const question = questions.find(q => q.id === questionId);
+      if (!question) return;
+
+      // Tally votes per option
+      const tallies = {};
+      (question.options || []).forEach((opt) => { tallies[opt] = 0; });
+      data.forEach((r) => {
+        const parts = (r.answer || '').split(',').map((s) => s.trim()).filter(Boolean);
+        parts.forEach((p) => {
+          if (tallies[p] !== undefined) tallies[p]++;
+        });
+      });
+
+      // Get top 10 options
+      const sortedOpts = Object.keys(tallies).sort((a, b) => tallies[b] - tallies[a]);
+      const top10 = sortedOpts.slice(0, 10);
+
+      if (top10.length > 0) {
+        // Delete existing entries for this question first (avoid duplicate key error)
+        const { error: deleteError } = await supabase
+          .from('top_responses')
+          .delete()
+          .eq('poll_id', poll.id)
+          .eq('question_id', questionId);
+
+        if (deleteError) console.error('Error deleting old top responses:', deleteError);
+
+        // Save to top_responses table
+        const top10Data = top10.map((option, rank) => ({
+          poll_id: poll.id,
+          question_id: questionId,
+          option: option,
+          rank: rank + 1,
+          votes: tallies[option],
+          created_at: new Date().toISOString()
+        }));
+
+        const { error: insertError } = await supabase
+          .from('top_responses')
+          .insert(top10Data);
+
+        if (insertError) throw insertError;
+      }
+    } catch (err) {
+      console.error('Error saving top 10 responses:', err);
+    }
+  };
+
+  // Save leaderboard for a range of questions (every 10 questions)
+  const saveLeaderboardRange = async (startIndexInclusive, endIndexExclusive) => {
+    try {
+      const slice = questions.slice(startIndexInclusive, endIndexExclusive);
+      const qIds = slice.map(q => q.id).filter(Boolean);
+      
+      const leaderboard = await computeLeaderboard(qIds);
+      
+      // Get the range display text (e.g., "Questions 1-10")
+      const rangeStart = startIndexInclusive + 1;
+      const rangeEnd = Math.min(endIndexExclusive, questions.length);
+      const rangeLabel = `Questions ${rangeStart}-${rangeEnd}`;
+
+      // Save to leaderboards table
+      const { error } = await supabase
+        .from('leaderboards')
+        .insert({
+          poll_id: poll.id,
+          range_label: rangeLabel,
+          start_question_index: startIndexInclusive,
+          end_question_index: endIndexExclusive,
+          leaderboard_data: leaderboard,
+          created_at: new Date().toISOString()
+        });
+
+      if (error) throw error;
+    } catch (err) {
+      console.error('Error saving range leaderboard:', err);
+    }
+  };
+
+  // Save overall leaderboard to Supabase
+  const saveOverallLeaderboardToDb = async () => {
+    try {
+      const qIds = questions.map(q => q.id).filter(Boolean);
+      const leaderboard = await computeLeaderboard(qIds);
+
+      // Save to leaderboards table
+      const { error } = await supabase
+        .from('leaderboards')
+        .insert({
+          poll_id: poll.id,
+          range_label: 'Overall',
+          start_question_index: 0,
+          end_question_index: questions.length,
+          leaderboard_data: leaderboard,
+          created_at: new Date().toISOString()
+        });
+
+      if (error) throw error;
+    } catch (err) {
+      console.error('Error saving overall leaderboard:', err);
+    }
+  };
+
+  const startQuestionTimer = (questionData, seconds = 30) => {
     clearQuestionTimer();
     setQuestionCountdown(seconds);
     questionTimerRef.current = setInterval(() => {
       setQuestionCountdown((prev) => {
         if (prev <= 1) {
           clearQuestionTimer();
+          // Save top 10 responses before ending question
+          if (questionData && questionData.id) {
+            saveTop10ResponsesForQuestion(questionData.id);
+          }
           // End question for participants by clearing current_question_id
           endQuestionOnServer();
           return 0;
@@ -494,8 +613,8 @@ export default function HostLive() {
       if (error) throw error;
       setPoll({ ...poll, current_question_id: q.id });
       setCurrentQuestion(q);
-      // Start 20s timer for this question
-      startQuestionTimer(20);
+      // Start 30s timer for this question
+      startQuestionTimer(q, 30);
     } catch (err) {
       console.error('Failed to start question:', err);
       setErrorMessage('Failed to start question.');
@@ -504,6 +623,9 @@ export default function HostLive() {
 
   const handleEndPoll = async () => {
     try {
+      // Save overall leaderboard before ending
+      await saveOverallLeaderboardToDb();
+
       const { error } = await supabase
         .from('polls')
         .update({
@@ -734,13 +856,33 @@ export default function HostLive() {
   const filteredQuestions = questions
     .map((q, idx) => ({ ...q, questionNumber: idx + 1, originalIndex: idx }))
     .filter((q) => {
-      const search = questionSearch.trim().toLowerCase();
+      const search = questionSearch.trim();
       if (!search) return true;
+      
+      const searchLower = search.toLowerCase();
       const optionText = (q.options || []).join(' ').toLowerCase();
+      
+      // Check for format like "95" where 9 = question 9, 5 = option 5
+      const isNumericSearch = /^\d+$/.test(search);
+      if (isNumericSearch && search.length >= 2) {
+        const questionNum = parseInt(search.slice(0, -1), 10);
+        const optionNum = parseInt(search.slice(-1), 10);
+        
+        // Match question number and option index
+        const hasMatchingOption = (q.options || []).some((opt, idx) => 
+          idx + 1 === optionNum && q.questionNumber === questionNum
+        );
+        
+        if (q.questionNumber === questionNum && hasMatchingOption) {
+          return true;
+        }
+      }
+      
+      // Original filter logic
       return (
-        q.text?.toLowerCase().includes(search) ||
+        q.text?.toLowerCase().includes(searchLower) ||
         String(q.questionNumber).includes(search) ||
-        optionText.includes(search)
+        optionText.includes(searchLower)
       );
     });
 
