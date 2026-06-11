@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { supabase } from '../supabaseClient';
 import { getHostId } from '../utils';
-import { Plus, BarChart2, Edit3, Trash2, Copy, Play, Check, Eye } from 'lucide-react';
+import { Plus, Edit3, Trash2, Copy, Play, Check } from 'lucide-react';
 
 export default function Dashboard() {
   const [polls, setPolls] = useState([]);
@@ -18,20 +18,20 @@ export default function Dashboard() {
   const fetchPolls = async () => {
     try {
       setLoading(true);
-      // Fetch polls with question details for this host
+      // Fetch ALL polls so they appear on every device/environment
       const { data, error } = await supabase
         .from('polls')
         .select(`
           id,
           title,
           join_code,
+          host_id,
           status,
           created_at,
           questions:questions!questions_poll_id_fkey (
             id
           )
         `)
-        .eq('host_id', hostId)
         .order('created_at', { ascending: false });
 
       if (error) throw error;
@@ -43,19 +43,22 @@ export default function Dashboard() {
     }
   };
 
-  const handleDelete = async (id) => {
+  const handleDelete = async (poll) => {
+    if (poll.host_id !== hostId) {
+      alert('You can only delete polls you created in this browser.');
+      return;
+    }
     if (!window.confirm('Are you sure you want to delete this poll and all its responses? This cannot be undone.')) {
       return;
     }
-
     try {
       const { error } = await supabase
         .from('polls')
         .delete()
-        .eq('id', id);
+        .eq('id', poll.id);
 
       if (error) throw error;
-      setPolls(polls.filter(p => p.id !== id));
+      setPolls(polls.filter(p => p.id !== poll.id));
     } catch (err) {
       console.error('Error deleting poll:', err);
       alert('Failed to delete poll.');
@@ -69,16 +72,16 @@ export default function Dashboard() {
     setTimeout(() => setCopiedId(null), 2000);
   };
 
-  // Helper to count active and total polls
   const totalPolls = polls.length;
   const activePollsCount = polls.filter(p => p.status === 'active').length;
+  const myPollsCount = polls.filter(p => p.host_id === hostId).length;
 
   return (
     <div>
       <div className="dashboard-header">
         <div>
           <h1>Host Dashboard</h1>
-          <p>Create and manage your live polls. Everything is stored locally in this browser.</p>
+          <p>All events across every device and environment are listed here.</p>
         </div>
         <button className="btn btn-primary" onClick={() => navigate('/polls/create')}>
           <Plus size={18} /> Create New Poll
@@ -86,14 +89,18 @@ export default function Dashboard() {
       </div>
 
       {/* Summary Cards */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '1rem', marginBottom: '2.5rem' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '1rem', marginBottom: '2.5rem' }}>
         <div className="glass-card" style={{ padding: '1.5rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-          <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', textTransform: 'uppercase', fontWeight: 600 }}>Total Polls</span>
+          <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', textTransform: 'uppercase', fontWeight: 600 }}>Total Events</span>
           <span style={{ fontSize: '2.5rem', fontWeight: 800, background: 'var(--gradient-primary)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>{totalPolls}</span>
         </div>
         <div className="glass-card" style={{ padding: '1.5rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-          <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', textTransform: 'uppercase', fontWeight: 600 }}>Active Events</span>
+          <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', textTransform: 'uppercase', fontWeight: 600 }}>Active Now</span>
           <span style={{ fontSize: '2.5rem', fontWeight: 800, color: 'var(--color-success)' }}>{activePollsCount}</span>
+        </div>
+        <div className="glass-card" style={{ padding: '1.5rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+          <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', textTransform: 'uppercase', fontWeight: 600 }}>Created by Me</span>
+          <span style={{ fontSize: '2.5rem', fontWeight: 800, color: 'var(--color-accent)' }}>{myPollsCount}</span>
         </div>
       </div>
 
@@ -113,14 +120,33 @@ export default function Dashboard() {
         <div className="polls-grid">
           {polls.map((poll) => {
             const questionCount = poll.questions ? poll.questions.length : 0;
+            const isMyPoll = poll.host_id === hostId;
             return (
               <div className="glass-card poll-card" key={poll.id}>
                 <div className="poll-card-header">
-                  <div>
-                    <h3 className="poll-card-title">{poll.title}</h3>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.25rem' }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.35rem', flexWrap: 'wrap' }}>
+                      <h3 className="poll-card-title" style={{ marginBottom: 0 }}>{poll.title}</h3>
+                      {isMyPoll && (
+                        <span style={{
+                          fontSize: '0.65rem',
+                          fontWeight: 700,
+                          padding: '0.15rem 0.5rem',
+                          background: 'rgba(6, 182, 212, 0.15)',
+                          color: 'var(--color-accent)',
+                          border: '1px solid rgba(6, 182, 212, 0.3)',
+                          borderRadius: '50px',
+                          textTransform: 'uppercase',
+                          letterSpacing: '0.05em',
+                          whiteSpace: 'nowrap',
+                        }}>
+                          Mine
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                       <span className="join-banner-code" style={{ fontSize: '1rem', fontWeight: 700 }}>
-                        Code: {poll.join_code}
+                        {poll.join_code}
                       </span>
                     </div>
                   </div>
@@ -136,34 +162,38 @@ export default function Dashboard() {
                 </div>
 
                 <div className="poll-card-actions">
-                  <button 
-                    className="btn btn-sm btn-primary" 
+                  <button
+                    className="btn btn-sm btn-primary"
                     onClick={() => navigate(`/polls/${poll.id}/host`)}
                     style={{ flex: 1 }}
                   >
                     <Play size={14} /> Go Live
                   </button>
-                  <button 
-                    className="btn btn-sm btn-secondary" 
-                    onClick={() => navigate(`/polls/${poll.id}/edit`)}
-                    title="Edit Poll"
-                  >
-                    <Edit3 size={14} />
-                  </button>
-                  <button 
+                  {isMyPoll && (
+                    <button
+                      className="btn btn-sm btn-secondary"
+                      onClick={() => navigate(`/polls/${poll.id}/edit`)}
+                      title="Edit Poll"
+                    >
+                      <Edit3 size={14} />
+                    </button>
+                  )}
+                  <button
                     className="btn btn-sm btn-secondary"
                     onClick={() => handleCopyLink(poll.join_code, poll.id)}
                     title="Copy Join Link"
                   >
                     {copiedId === poll.id ? <Check size={14} color="var(--color-success)" /> : <Copy size={14} />}
                   </button>
-                  <button 
-                    className="btn btn-sm btn-danger" 
-                    onClick={() => handleDelete(poll.id)}
-                    title="Delete Poll"
-                  >
-                    <Trash2 size={14} />
-                  </button>
+                  {isMyPoll && (
+                    <button
+                      className="btn btn-sm btn-danger"
+                      onClick={() => handleDelete(poll)}
+                      title="Delete Poll"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  )}
                 </div>
               </div>
             );
