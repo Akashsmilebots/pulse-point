@@ -7,10 +7,11 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "firebaseDeploy": "npm run build && firebase deploy"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.108.1",
+    "firebase": "^12.14.0",
     "lucide-react": "^1.17.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
@@ -24,6 +25,7 @@
     "eslint": "^10.3.0",
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.2",
+    "firebase-tools": "^15.20.0",
     "globals": "^17.6.0",
     "vite": "^8.0.12"
   }

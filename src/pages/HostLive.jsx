@@ -1,18 +1,35 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { supabase } from '../supabaseClient';
+import {
+  getPollById,
+  getQuestionsForPoll,
+  saveDraftQuestions,
+  updatePoll,
+  resetPollData,
+  subscribeToParticipantsCount,
+  subscribeToResponsesForQuestion,
+  subscribeToAllResponses,
+  updateLeaderboard,
+  auth,
+  hasValidConfig,
+  syncHostAuthUid
+} from '../lib/firebase';
 import { getHostId } from '../utils';
-import { ArrowLeft, Play, Square, RefreshCw, Users, AlertCircle, Copy, Check, ChevronRight, ChevronLeft, Plus, Save } from 'lucide-react';
+import { ArrowLeft, Play, Square, RefreshCw, Users, Copy, Check, ChevronRight, ChevronLeft, Plus, Save, Monitor, ExternalLink } from 'lucide-react';
 
 export default function HostLive() {
   const { id } = useParams();
   const navigate = useNavigate();
   const hostId = getHostId();
 
+  const username = localStorage.getItem('pulsepoint_host_username');
+  const phone = localStorage.getItem('pulsepoint_host_phone');
+
   const [poll, setPoll] = useState(null);
   const [questions, setQuestions] = useState([]);
   const [currentQuestion, setCurrentQuestion] = useState(null);
   const [responses, setResponses] = useState([]);
+  const [allResponses, setAllResponses] = useState({});
   const [participantCount, setParticipantCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [copied, setCopied] = useState(false);
@@ -23,110 +40,56 @@ export default function HostLive() {
   const [questionSearch, setQuestionSearch] = useState('');
   const [draftQuestionIndex, setDraftQuestionIndex] = useState(0);
   const [questionCountdown, setQuestionCountdown] = useState(0);
+  const [completedQIds, setCompletedQIds] = useState(new Set());
+  const [showQR, setShowQR] = useState(false);
+  const [projectorTab, setProjectorTab] = useState('home');
+  const [projectorLbRange, setProjectorLbRange] = useState(-1);
+  const [qTabSelectedQ, setQTabSelectedQ] = useState(null);
   const questionTimerRef = useRef(null);
-  const [rangeLeaderboard, setRangeLeaderboard] = useState([]);
-  const [overallLeaderboard, setOverallLeaderboard] = useState([]);
-  const [showRangeLeaderboard, setShowRangeLeaderboard] = useState(false);
-  const [showOverallLeaderboard, setShowOverallLeaderboard] = useState(false);
-
   // Keep a ref to the active question ID for the realtime channel callback
   const activeQuestionIdRef = useRef(null);
+  // Tracks the most recently *started* question; prevents a late-firing timer from
+  // resetting the projector back to banner after the host has already moved on.
+  const activeStartedQIdRef = useRef(null);
 
-  useEffect(() => {
-    fetchPollAndQuestions();
-  }, [id]);
-
-  useEffect(() => {
-    if (poll?.status === 'draft' && questions.length > 0) {
-      setDraftQuestionIndex(0);
-    }
-  }, [poll?.status, questions.length]);
-
-  useEffect(() => {
-    setDraftQuestionIndex(0);
-  }, [questionSearch]);
-
-  useEffect(() => {
-    if (!poll) return;
-
-    // 1. Subscribe to Participant changes
-    const participantChannel = supabase
-      .channel(`live-participants-${poll.id}`)
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'participants', filter: `poll_id=eq.${poll.id}` },
-        () => {
-          fetchParticipantCount();
-        }
-      )
-      .subscribe();
-
-    fetchParticipantCount();
-
-    return () => {
-      supabase.removeChannel(participantChannel);
-    };
-  }, [poll?.id]);
-
-  useEffect(() => {
-    if (!currentQuestion) {
-      setResponses([]);
-      return;
-    }
-
-    activeQuestionIdRef.current = currentQuestion.id;
-    fetchResponses(currentQuestion.id);
-
-    // 2. Subscribe to Response changes for the current question
-    const responseChannel = supabase
-      .channel(`live-responses-${currentQuestion.id}`)
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'responses', filter: `question_id=eq.${currentQuestion.id}` },
-        () => {
-          // Re-fetch responses to get the participant joins
-          if (activeQuestionIdRef.current) {
-            fetchResponses(activeQuestionIdRef.current);
-          }
-        }
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(responseChannel);
-    };
-  }, [currentQuestion?.id]);
-
-  const fetchPollAndQuestions = async () => {
+  async function fetchPollAndQuestions() {
     try {
       setLoading(true);
-      
-      // Fetch poll details
-      const { data: pollData, error: pollError } = await supabase
-        .from('polls')
-        .select('*')
-        .eq('id', id)
-        .eq('host_id', hostId)
-        .single();
 
-      if (pollError || !pollData) {
-        console.error('Error fetching poll:', pollError);
-        setErrorMessage('Poll not found or unauthorized.');
+      // 1. Fetch poll details and questions in parallel immediately!
+      const [pollData, qData] = await Promise.all([
+        getPollById(id), // Fetch poll details without enforcing host_id during DB read
+        getQuestionsForPoll(id)
+      ]);
+
+      if (!pollData) {
+        setErrorMessage('Poll not found.');
+        navigate('/dashboard');
+        return;
+      }
+
+      // 2. Resolve Auth details without blocking Firestore reads
+      let currentUser = auth.currentUser;
+      if (!currentUser && hasValidConfig) {
+        currentUser = await new Promise((resolve) => {
+          const unsubscribe = auth.onAuthStateChanged((user) => {
+            unsubscribe();
+            resolve(user);
+          });
+        });
+      }
+
+      const effectiveHostId = currentUser ? currentUser.uid : hostId;
+
+      // 3. Verify host ownership after data and auth are both loaded
+      if (pollData.host_id !== effectiveHostId && pollData.host_id !== hostId) {
+        setErrorMessage('Unauthorized to manage this poll.');
         navigate('/dashboard');
         return;
       }
 
       setPoll(pollData);
       setDraftTitle(pollData.title || '');
-
-      // Fetch questions
-      const { data: qData, error: qError } = await supabase
-        .from('questions')
-        .select('*')
-        .eq('poll_id', id)
-        .order('order_index', { ascending: true });
-
-      if (qError) throw qError;
       setQuestions(qData || []);
 
       // Determine current active question
@@ -134,7 +97,6 @@ export default function HostLive() {
         const activeQ = qData.find((q) => q.id === pollData.current_question_id);
         setCurrentQuestion(activeQ || qData[0] || null);
       } else if (qData.length > 0) {
-        // Default to first question (even if draft)
         setCurrentQuestion(qData[0]);
       }
     } catch (err) {
@@ -143,23 +105,74 @@ export default function HostLive() {
     } finally {
       setLoading(false);
     }
-  };
+  }
 
-  const fetchParticipantCount = async () => {
-    if (!poll) return;
-    try {
-      const { count, error } = await supabase
-        .from('participants')
-        .select('*', { count: 'exact', head: true })
-        .eq('poll_id', poll.id);
-      
-      if (!error) {
-        setParticipantCount(count || 0);
-      }
-    } catch (err) {
-      console.error('Error getting participant count:', err);
+  useEffect(() => {
+    if (!username || !phone) {
+      navigate('/host/login');
+      return;
     }
-  };
+    syncHostAuthUid(username, phone);
+  }, [username, phone, navigate]);
+
+  useEffect(() => {
+    if (username && phone) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      fetchPollAndQuestions();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, username, phone]);
+
+  useEffect(() => {
+    if (poll?.status === 'draft' && questions.length > 0) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setDraftQuestionIndex(0);
+    }
+  }, [poll?.status, questions.length]);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setDraftQuestionIndex(0);
+  }, [questionSearch]);
+
+  useEffect(() => {
+    if (!poll) return;
+
+    const unsubscribe = subscribeToParticipantsCount(poll.id, (count) => {
+      setParticipantCount(count);
+    });
+
+    return () => {
+      unsubscribe();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [poll?.id]);
+
+  useEffect(() => {
+    if (!poll?.id) return;
+    const unsub = subscribeToAllResponses(poll.id, setAllResponses);
+    return () => unsub();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [poll?.id]);
+
+  useEffect(() => {
+    if (!currentQuestion) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setResponses([]);
+      return;
+    }
+
+    activeQuestionIdRef.current = currentQuestion.id;
+
+    const unsubscribe = subscribeToResponsesForQuestion(poll.id, currentQuestion.id, (respsList) => {
+      setResponses(respsList);
+    });
+
+    return () => {
+      unsubscribe();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentQuestion?.id]);
 
   const handleAddQuestion = () => {
     const updated = [
@@ -225,15 +238,15 @@ export default function HostLive() {
     setQuestions(updated);
   };
 
-  const handleMoveQuestion = (index, direction) => {
-    if (direction === 'up' && index === 0) return;
-    if (direction === 'down' && index === questions.length - 1) return;
-
-    const updated = [...questions];
-    const swapIndex = direction === 'up' ? index - 1 : index + 1;
-    [updated[index], updated[swapIndex]] = [updated[swapIndex], updated[index]];
-    setQuestions(updated);
-  };
+  // const handleMoveQuestion = (index, direction) => {
+  //   if (direction === 'up' && index === 0) return;
+  //   if (direction === 'down' && index === questions.length - 1) return;
+  // 
+  //   const updated = [...questions];
+  //   const swapIndex = direction === 'up' ? index - 1 : index + 1;
+  //   [updated[index], updated[swapIndex]] = [updated[swapIndex], updated[index]];
+  //   setQuestions(updated);
+  // };
 
   const handleSaveDraft = async () => {
     if (!poll) return false;
@@ -261,39 +274,41 @@ export default function HostLive() {
 
     setSavingDraft(true);
     try {
-      const { error: pollError } = await supabase
-        .from('polls')
-        .update({ title: draftTitle.trim() })
-        .eq('id', poll.id)
-        .eq('host_id', hostId);
-      if (pollError) throw pollError;
+      // Find the index of the currently active question in the old questions list
+      const currentIdx = currentQuestion ? questions.findIndex(q => q.id === currentQuestion.id) : -1;
 
-      const { error: deleteError } = await supabase
-        .from('questions')
-        .delete()
-        .eq('poll_id', poll.id);
-      if (deleteError) throw deleteError;
-
-      if (questions.length > 0) {
-        const questionsToInsert = questions.map((q, idx) => ({
-          poll_id: poll.id,
-          text: q.text.trim(),
-          type: q.type,
-          options: q.type === 'multiple_choice' ? q.options.map((o) => o.trim()) : [],
-          order_index: idx
-        }));
-
-        const { error: insertError } = await supabase
-          .from('questions')
-          .insert(questionsToInsert);
-
-        if (insertError) throw insertError;
+      // saveDraftQuestions returns the freshly saved questions — no re-fetch needed
+      const savedQuestions = await saveDraftQuestions(poll.id, draftTitle.trim(), questions);
+      
+      let newCurrentQuestion = null;
+      if (savedQuestions.length > 0) {
+        if (currentIdx !== -1 && currentIdx < savedQuestions.length) {
+          newCurrentQuestion = savedQuestions[currentIdx];
+        } else {
+          newCurrentQuestion = savedQuestions[0];
+        }
+      }
+      
+      // If the poll is active and has a current_question_id, we need to update it in Firestore with the new ID
+      if (poll.status === 'active' && poll.current_question_id) {
+        const activeQIdx = questions.findIndex(q => q.id === poll.current_question_id);
+        if (activeQIdx !== -1 && activeQIdx < savedQuestions.length) {
+          const newActiveQId = savedQuestions[activeQIdx].id;
+          await updatePoll(poll.id, { current_question_id: newActiveQId });
+          setPoll({ ...poll, title: draftTitle.trim(), current_question_id: newActiveQId });
+        } else {
+          await updatePoll(poll.id, { current_question_id: null });
+          setPoll({ ...poll, title: draftTitle.trim(), current_question_id: null });
+        }
+      } else {
+        setPoll({ ...poll, title: draftTitle.trim() });
       }
 
-      setPoll({ ...poll, title: draftTitle.trim() });
+      setQuestions(savedQuestions);
+      setCurrentQuestion(newCurrentQuestion);
+
       setSaveMessage('Draft saved successfully.');
       setTimeout(() => setSaveMessage(''), 3000);
-      await fetchPollAndQuestions();
       return true;
     } catch (err) {
       console.error(err);
@@ -304,121 +319,22 @@ export default function HostLive() {
     }
   };
 
-  const fetchResponses = async (qId) => {
-    try {
-      const { data, error } = await supabase
-        .from('responses')
-        .select(`
-          id,
-          answer,
-          created_at,
-          participants (
-            name
-          )
-        `)
-        .eq('question_id', qId);
-
-      if (error) throw error;
-      setResponses(data || []);
-    } catch (err) {
-      console.error('Error fetching responses:', err);
-    }
-  };
-
-  // Compute leaderboard for an array of question IDs
-  const computeLeaderboard = async (questionIds) => {
-    try {
-      if (!questionIds || questionIds.length === 0) return [];
-      const { data, error } = await supabase
-        .from('responses')
-        .select(`id, answer, question_id, participant_id, participants (id, name, phone)`)
-        .in('question_id', questionIds);
-
-      if (error) throw error;
-
-      // Group responses by question
-      const responsesByQuestion = {};
-      data.forEach((r) => {
-        responsesByQuestion[r.question_id] = responsesByQuestion[r.question_id] || [];
-        responsesByQuestion[r.question_id].push(r);
-      });
-
-      const pointsByParticipant = {};
-
-      // For each question, compute top-10 options and award points per selection
-      for (const qId of questionIds) {
-        const q = questions.find((qq) => qq.id === qId);
-        if (!q) continue;
-        const resps = responsesByQuestion[qId] || [];
-
-        // Tally votes per option
-        const tallies = {};
-        (q.options || []).forEach((opt) => { tallies[opt] = 0; });
-        resps.forEach((r) => {
-          const parts = (r.answer || '').split(',').map((s) => s.trim()).filter(Boolean);
-          parts.forEach((p) => {
-            if (tallies[p] !== undefined) tallies[p]++;
-          });
-        });
-
-        // Determine top-10 options
-        const sortedOpts = Object.keys(tallies).sort((a, b) => tallies[b] - tallies[a]);
-        const top10 = sortedOpts.slice(0, 10);
-        const rankMap = {};
-        top10.forEach((opt, idx) => { rankMap[opt] = idx + 1; });
-
-        // Award points to participants based on their selected options
-        resps.forEach((r) => {
-          const pid = r.participant_id;
-          if (!pointsByParticipant[pid]) {
-            pointsByParticipant[pid] = { name: r.participants?.name || 'Anonymous', phone: r.participants?.phone || '', points: 0 };
-          }
-          const parts = (r.answer || '').split(',').map((s) => s.trim()).filter(Boolean);
-          parts.forEach((p) => {
-            const rank = rankMap[p];
-            if (rank) {
-              pointsByParticipant[pid].points += (11 - rank);
-            }
-          });
-        });
-      }
-
-      const arr = Object.keys(pointsByParticipant).map((pid) => ({ participant_id: pid, name: pointsByParticipant[pid].name, phone: pointsByParticipant[pid].phone, points: pointsByParticipant[pid].points }));
-      arr.sort((a, b) => b.points - a.points);
-      return arr;
-    } catch (err) {
-      console.error('Error computing leaderboard:', err);
-      return [];
-    }
-  };
-
-  const showLeaderboardForRange = async (startIndexInclusive) => {
-    const slice = questions.slice(startIndexInclusive, startIndexInclusive + 10);
-    const qIds = slice.map(q => q.id).filter(Boolean);
-    const lb = await computeLeaderboard(qIds);
-    setRangeLeaderboard(lb);
-    setShowRangeLeaderboard(true);
-  };
-
-  const showOverall = async () => {
-    const qIds = questions.map(q => q.id).filter(Boolean);
-    const lb = await computeLeaderboard(qIds);
-    setOverallLeaderboard(lb);
-    setShowOverallLeaderboard(true);
-  };
-
-  // When current question moves and it's the 10th, 20th, etc., show range leaderboard and save it
+  // When current question moves and it's the 10th, 20th, etc.:
+  // save leaderboard and auto-switch projector to show that range leaderboard
   useEffect(() => {
-    if (!currentQuestion || questions.length === 0) return;
+    if (!currentQuestion || questions.length === 0 || !poll) return;
     const idx = questions.findIndex(q => q.id === currentQuestion.id);
     if (idx < 0) return;
-    const qNumber = idx + 1;
-    if (qNumber % 10 === 0) {
-      const start = Math.floor(idx / 10) * 10;
-      showLeaderboardForRange(start);
-      // Save this range leaderboard to Supabase
-      saveLeaderboardRange(start, start + 10);
+    if ((idx + 1) % 10 === 0) {
+      const rangeIdx = Math.floor(idx / 10);
+      const projMode = `leaderboard_range_${rangeIdx}`;
+      setTimeout(async () => {
+        await updateLeaderboard(poll.id);
+        await updatePoll(poll.id, { projector_mode: projMode });
+        setPoll(prev => prev ? { ...prev, projector_mode: projMode } : prev);
+      }, 600);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentQuestion?.id]);
 
   const handleStartPoll = async () => {
@@ -432,17 +348,14 @@ export default function HostLive() {
     if (!saved) return;
 
     try {
-      // Start session but do not start the first question automatically.
-      const { error } = await supabase
-        .from('polls')
-        .update({
-          status: 'active',
-          current_question_id: null
-        })
-        .eq('id', poll.id);
-
-      if (error) throw error;
-      setPoll({ ...poll, status: 'active', current_question_id: null });
+      // Start session — reset projector to banner so stale projector_mode from a
+      // previous run never leaks through before the host clicks "Start Question".
+      await updatePoll(poll.id, {
+        status: 'active',
+        current_question_id: null,
+        projector_mode: 'banner',
+      });
+      setPoll({ ...poll, status: 'active', current_question_id: null, projector_mode: 'banner' });
     } catch (err) {
       console.error(err);
       setErrorMessage('Failed to start poll. Please try again.');
@@ -457,145 +370,41 @@ export default function HostLive() {
     setQuestionCountdown(0);
   };
 
-  const endQuestionOnServer = async () => {
+  const endQuestionOnServer = async (doneQId) => {
     try {
-      const { error } = await supabase
-        .from('polls')
-        .update({ current_question_id: null })
-        .eq('id', poll.id);
-      if (error) console.error('Error clearing current_question_id:', error);
-      setPoll((p) => ({ ...p, current_question_id: null }));
+      if (doneQId) {
+        setCompletedQIds((prev) => new Set([...prev, doneQId]));
+      }
+      // If the host already moved to a new question, don't reset projector back to banner.
+      if (activeStartedQIdRef.current && activeStartedQIdRef.current !== doneQId) return;
+      await updatePoll(poll.id, { current_question_id: null, projector_mode: 'banner' });
+      setPoll((p) => ({ ...p, current_question_id: null, projector_mode: 'banner' }));
     } catch (err) {
       console.error(err);
     }
   };
 
-  // Save top 10 responses for a question to Supabase
-  const saveTop10ResponsesForQuestion = async (questionId) => {
-    try {
-      const { data, error } = await supabase
-        .from('responses')
-        .select(`id, answer, question_id, participant_id, participants (id, name, phone)`)
-        .eq('question_id', questionId);
+  // Sync top 10 responses for a question
+  async function saveTop10ResponsesForQuestion() {
+    await updateLeaderboard(poll.id);
+  }
 
-      if (error) throw error;
+  // Sync overall leaderboard to Firebase
+  async function saveOverallLeaderboardToDb() {
+    await updateLeaderboard(poll.id);
+  }
 
-      const question = questions.find(q => q.id === questionId);
-      if (!question) return;
-
-      // Tally votes per option
-      const tallies = {};
-      (question.options || []).forEach((opt) => { tallies[opt] = 0; });
-      data.forEach((r) => {
-        const parts = (r.answer || '').split(',').map((s) => s.trim()).filter(Boolean);
-        parts.forEach((p) => {
-          if (tallies[p] !== undefined) tallies[p]++;
-        });
-      });
-
-      // Get top 10 options
-      const sortedOpts = Object.keys(tallies).sort((a, b) => tallies[b] - tallies[a]);
-      const top10 = sortedOpts.slice(0, 10);
-
-      if (top10.length > 0) {
-        // Delete existing entries for this question first (avoid duplicate key error)
-        const { error: deleteError } = await supabase
-          .from('top_responses')
-          .delete()
-          .eq('poll_id', poll.id)
-          .eq('question_id', questionId);
-
-        if (deleteError) console.error('Error deleting old top responses:', deleteError);
-
-        // Save to top_responses table
-        const top10Data = top10.map((option, rank) => ({
-          poll_id: poll.id,
-          question_id: questionId,
-          option: option,
-          rank: rank + 1,
-          votes: tallies[option],
-          created_at: new Date().toISOString()
-        }));
-
-        const { error: insertError } = await supabase
-          .from('top_responses')
-          .insert(top10Data);
-
-        if (insertError) throw insertError;
-      }
-    } catch (err) {
-      console.error('Error saving top 10 responses:', err);
-    }
-  };
-
-  // Save leaderboard for a range of questions (every 10 questions)
-  const saveLeaderboardRange = async (startIndexInclusive, endIndexExclusive) => {
-    try {
-      const slice = questions.slice(startIndexInclusive, endIndexExclusive);
-      const qIds = slice.map(q => q.id).filter(Boolean);
-      
-      const leaderboard = await computeLeaderboard(qIds);
-      
-      // Get the range display text (e.g., "Questions 1-10")
-      const rangeStart = startIndexInclusive + 1;
-      const rangeEnd = Math.min(endIndexExclusive, questions.length);
-      const rangeLabel = `Questions ${rangeStart}-${rangeEnd}`;
-
-      // Save to leaderboards table
-      const { error } = await supabase
-        .from('leaderboards')
-        .insert({
-          poll_id: poll.id,
-          range_label: rangeLabel,
-          start_question_index: startIndexInclusive,
-          end_question_index: endIndexExclusive,
-          leaderboard_data: leaderboard,
-          created_at: new Date().toISOString()
-        });
-
-      if (error) throw error;
-    } catch (err) {
-      console.error('Error saving range leaderboard:', err);
-    }
-  };
-
-  // Save overall leaderboard to Supabase
-  const saveOverallLeaderboardToDb = async () => {
-    try {
-      const qIds = questions.map(q => q.id).filter(Boolean);
-      const leaderboard = await computeLeaderboard(qIds);
-
-      // Save to leaderboards table
-      const { error } = await supabase
-        .from('leaderboards')
-        .insert({
-          poll_id: poll.id,
-          range_label: 'Overall',
-          start_question_index: 0,
-          end_question_index: questions.length,
-          leaderboard_data: leaderboard,
-          created_at: new Date().toISOString()
-        });
-
-      if (error) throw error;
-    } catch (err) {
-      console.error('Error saving overall leaderboard:', err);
-    }
-  };
-
-  const startQuestionTimer = (questionData, seconds = 30) => {
+  const startQuestionTimer = (questionData, seconds = 35) => {
     clearQuestionTimer();
     setQuestionCountdown(seconds);
     questionTimerRef.current = setInterval(() => {
       setQuestionCountdown((prev) => {
         if (prev <= 1) {
           clearQuestionTimer();
-          // Save top 10 responses before ending question
           if (questionData && questionData.id) {
             saveTop10ResponsesForQuestion(questionData.id);
           }
-          // End question for participants by clearing current_question_id
-          endQuestionOnServer();
+          endQuestionOnServer(questionData?.id);
           return 0;
         }
         return prev - 1;
@@ -605,16 +414,18 @@ export default function HostLive() {
 
   const handleStartQuestion = async (q) => {
     if (!poll) return;
+    activeStartedQIdRef.current = q.id; // set synchronously so endQuestionOnServer sees it immediately
     try {
-      const { error } = await supabase
-        .from('polls')
-        .update({ current_question_id: q.id })
-        .eq('id', poll.id);
-      if (error) throw error;
-      setPoll({ ...poll, current_question_id: q.id });
+      await updatePoll(poll.id, {
+        current_question_id: q.id,
+        projector_mode: 'question',
+        projector_question_id: q.id,
+      });
+      setPoll(p => ({ ...p, current_question_id: q.id, projector_mode: 'question', projector_question_id: q.id }));
       setCurrentQuestion(q);
-      // Start 30s timer for this question
-      startQuestionTimer(q, 30);
+      setProjectorTab('question');
+      setQTabSelectedQ(q);
+      startQuestionTimer(q, 38);
     } catch (err) {
       console.error('Failed to start question:', err);
       setErrorMessage('Failed to start question.');
@@ -626,16 +437,12 @@ export default function HostLive() {
       // Save overall leaderboard before ending
       await saveOverallLeaderboardToDb();
 
-      const { error } = await supabase
-        .from('polls')
-        .update({
-          status: 'ended',
-          current_question_id: null
-        })
-        .eq('id', poll.id);
-
-      if (error) throw error;
-      setPoll({ ...poll, status: 'ended', current_question_id: null });
+      await updatePoll(poll.id, {
+        status: 'ended',
+        current_question_id: null,
+        projector_mode: 'banner',
+      });
+      setPoll({ ...poll, status: 'ended', current_question_id: null, projector_mode: 'banner' });
       setCurrentQuestion(currentQuestion || questions[0] || null);
     } catch (err) {
       console.error(err);
@@ -650,24 +457,7 @@ export default function HostLive() {
 
     try {
       setLoading(true);
-      // 1. Delete participants (cascades and deletes responses too)
-      const { error: delPartError } = await supabase
-        .from('participants')
-        .delete()
-        .eq('poll_id', poll.id);
-
-      if (delPartError) throw delPartError;
-
-      // 2. Set poll status back to draft, reset current question
-      const { error: pollError } = await supabase
-        .from('polls')
-        .update({
-          status: 'draft',
-          current_question_id: null
-        })
-        .eq('id', poll.id);
-
-      if (pollError) throw pollError;
+      await resetPollData(poll.id);
 
       setPoll({ ...poll, status: 'draft', current_question_id: null });
       if (questions.length > 0) {
@@ -686,12 +476,8 @@ export default function HostLive() {
   const handleSetActiveQuestion = async (q) => {
     if (!(poll.status === 'active' || poll.status === 'ended')) return;
     try {
-      const { error } = await supabase
-        .from('polls')
-        .update({ current_question_id: q.id })
-        .eq('id', poll.id);
+      await updatePoll(poll.id, { current_question_id: q.id });
 
-      if (error) throw error;
       setPoll({ ...poll, current_question_id: q.id });
       setCurrentQuestion(q);
     } catch (err) {
@@ -725,6 +511,96 @@ export default function HostLive() {
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const handleSetProjectorTab = async (tab) => {
+    setProjectorTab(tab);
+    if (!poll) return;
+    let mode;
+    const extra = {};
+    if (tab === 'home') {
+      mode = 'banner';
+    } else if (tab === 'question') {
+      const initQ = currentQuestion || questions[0] || null;
+      if (initQ) setQTabSelectedQ(initQ);
+      // Keep projector on banner until the host explicitly starts the first question.
+      // Use allResponses so the guard survives a page reload (completedQIds is local only).
+      const anyAnswered = questions.some(q => allResponses[q.id]?.length > 0);
+      if (!poll.current_question_id && !anyAnswered) return;
+      mode = 'question';
+      if (initQ) extra.projector_question_id = initQ.id;
+    } else if (tab === 'results') {
+      mode = 'results';
+      if (currentQuestion) {
+        extra.projector_question_id = currentQuestion.id;
+        const existing = poll.projector_reveals || {};
+        if (!existing[currentQuestion.id]) {
+          extra.projector_reveals = { ...existing, [currentQuestion.id]: (currentQuestion.options || []).map(() => false) };
+        }
+      }
+    } else if (tab === 'leaderboard') {
+      mode = projectorLbRange < 0 ? 'leaderboard_overall' : `leaderboard_range_${projectorLbRange}`;
+      updateLeaderboard(poll.id).catch(() => {});
+    }
+    setPoll(p => ({ ...p, projector_mode: mode, ...extra }));
+    updatePoll(poll.id, { projector_mode: mode, ...extra }).catch(console.error);
+  };
+
+  const handleToggleReveal = async (optionIndex) => {
+    if (!currentQuestion || !poll) return;
+    const qId = currentQuestion.id;
+    const options = currentQuestion.options || [];
+    const cur = (poll.projector_reveals || {})[qId] || options.map(() => false);
+    const updated = [...cur];
+    updated[optionIndex] = !updated[optionIndex];
+    const updatedReveals = { ...(poll.projector_reveals || {}), [qId]: updated };
+    setPoll(p => ({ ...p, projector_reveals: updatedReveals }));
+    updatePoll(poll.id, { projector_reveals: updatedReveals }).catch(console.error);
+  };
+
+  const handleRevealNext = async () => {
+    if (!currentQuestion || !poll) return;
+    const qId = currentQuestion.id;
+    const options = currentQuestion.options || [];
+    const tallies = {};
+    options.forEach(o => { tallies[o] = 0; });
+    responses.forEach(r => {
+      (r.answer || '').split(',').map(s => s.trim()).filter(Boolean).forEach(a => {
+        if (tallies[a] !== undefined) tallies[a]++;
+      });
+    });
+    const sorted = options.slice().sort((a, b) => {
+      const diff = (tallies[b] || 0) - (tallies[a] || 0);
+      return diff !== 0 ? diff : options.indexOf(a) - options.indexOf(b);
+    });
+    const cur = (poll.projector_reveals || {})[qId] || options.map(() => false);
+    const displayCount = Math.min(sorted.length, 10);
+    for (let pos = displayCount - 1; pos >= 0; pos--) {
+      const optIdx = options.indexOf(sorted[pos]);
+      if (optIdx >= 0 && !cur[optIdx]) {
+        const updated = [...cur];
+        updated[optIdx] = true;
+        const updatedReveals = { ...(poll.projector_reveals || {}), [qId]: updated };
+        setPoll(p => ({ ...p, projector_reveals: updatedReveals }));
+        await updatePoll(poll.id, { projector_reveals: updatedReveals });
+        return;
+      }
+    }
+  };
+
+  const handleHideAllReveals = async () => {
+    if (!currentQuestion || !poll) return;
+    const qId = currentQuestion.id;
+    const options = currentQuestion.options || [];
+    const updatedReveals = { ...(poll.projector_reveals || {}), [qId]: options.map(() => false) };
+    setPoll(p => ({ ...p, projector_reveals: updatedReveals }));
+    await updatePoll(poll.id, { projector_reveals: updatedReveals });
+  };
+
+  const handleQTabSelectQuestion = (q) => {
+    // Navigator is host-view only — never touches Firestore/projector.
+    // The projector is driven exclusively by Start Question / Next buttons.
+    setQTabSelectedQ(q);
+  };
+
   // Helper calculation for MC Responses
   const renderMCResults = () => {
     if (!currentQuestion) return null;
@@ -743,12 +619,12 @@ export default function HostLive() {
       });
     });
 
-    // Sort options by votes desc, tie-break alphabetically
+    // Sort options by votes desc; tie-break by original CSV order
     const sortedOptions = options.slice().sort((a, b) => {
       const da = tallies[a] || 0;
       const db = tallies[b] || 0;
       if (db !== da) return db - da;
-      return a.localeCompare(b);
+      return options.indexOf(a) - options.indexOf(b);
     });
 
     return (
@@ -843,6 +719,94 @@ export default function HostLive() {
     );
   };
 
+  const renderForQ = (q, resps) => {
+    if (!q) return null;
+    if (q.type === 'multiple_choice') {
+      const opts = q.options || [];
+      const tallies = {};
+      opts.forEach(o => { tallies[o] = 0; });
+      resps.forEach(r => {
+        (r.answer || '').split(',').map(s => s.trim()).filter(Boolean).forEach(a => {
+          if (tallies[a] !== undefined) tallies[a]++;
+        });
+      });
+      const totalVotes = resps.length;
+      const sortedOpts = opts.slice().sort((a, b) => {
+        const diff = (tallies[b] || 0) - (tallies[a] || 0);
+        return diff !== 0 ? diff : opts.indexOf(a) - opts.indexOf(b);
+      });
+      return (
+        <div className="results-container">
+          {sortedOpts.map((opt, idx) => {
+            const votes = tallies[opt] || 0;
+            const pct = totalVotes > 0 ? Math.round(votes / totalVotes * 100) : 0;
+            return (
+              <div className="result-bar-wrapper" key={idx}>
+                <div className="result-bar-header">
+                  <span className="result-bar-label">{opt}</span>
+                  <span className="result-bar-stats">{votes} vote{votes !== 1 ? 's' : ''} ({pct}%)</span>
+                </div>
+                <div className="result-bar-bg">
+                  <div className="result-bar-fill" style={{ width: `${pct}%` }} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+    if (q.type === 'rating') {
+      const totalVotes = resps.length;
+      let sum = 0;
+      const rTallies = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+      resps.forEach(r => {
+        const val = parseInt(r.answer, 10);
+        if (!isNaN(val)) { sum += val; rTallies[val] = (rTallies[val] || 0) + 1; }
+      });
+      const avg = totalVotes > 0 ? (sum / totalVotes).toFixed(1) : '0.0';
+      return (
+        <div className="rating-result-grid">
+          <div className="rating-avg-card">
+            <span className="rating-avg-number">{avg}</span>
+            <span className="rating-avg-stars">{'★'.repeat(Math.round(parseFloat(avg)))}{'☆'.repeat(5 - Math.round(parseFloat(avg)))}</span>
+            <p style={{ marginTop: '0.5rem', fontSize: '0.85rem' }}>Based on {totalVotes} response{totalVotes !== 1 ? 's' : ''}</p>
+          </div>
+          <div className="results-container" style={{ margin: 0 }}>
+            {[5, 4, 3, 2, 1].map(stars => {
+              const count = rTallies[stars] || 0;
+              const pct = totalVotes > 0 ? Math.round((count / totalVotes) * 100) : 0;
+              return (
+                <div className="result-bar-wrapper" key={stars}>
+                  <div className="result-bar-header" style={{ fontSize: '0.85rem' }}>
+                    <span className="result-bar-label" style={{ color: 'var(--text-secondary)' }}>{stars} Star{stars !== 1 ? 's' : ''}</span>
+                    <span className="result-bar-stats">{count} ({pct}%)</span>
+                  </div>
+                  <div className="result-bar-bg" style={{ height: '12px' }}>
+                    <div className="result-bar-fill" style={{ width: `${pct}%`, background: 'var(--color-accent)' }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+    if (q.type === 'open_text') {
+      if (resps.length === 0) return <div style={{ textAlign: 'center', color: 'var(--text-muted)', margin: '3rem 0' }}>Waiting for text responses...</div>;
+      return (
+        <div className="text-responses-grid">
+          {resps.map(resp => (
+            <div className="text-response-card" key={resp.id}>
+              <p style={{ color: 'var(--text-primary)', fontStyle: 'italic' }}>"{resp.answer}"</p>
+              <div className="text-response-author">— {resp.participants ? resp.participants.name : 'Anonymous'}</div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+    return null;
+  };
+
   if (loading) {
     return (
       <div style={{ display: 'flex', justifyContent: 'center', margin: '4rem 0' }}>
@@ -851,7 +815,29 @@ export default function HostLive() {
     );
   }
 
+  if (!poll) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', margin: '4rem 0', gap: '1rem' }}>
+        <p style={{ color: 'var(--text-secondary)' }}>{errorMessage || 'Poll not found or unauthorized.'}</p>
+        <button className="btn btn-secondary" onClick={() => navigate('/dashboard')}>Back to Dashboard</button>
+      </div>
+    );
+  }
+
   const currentIndex = questions.findIndex(q => q.id === currentQuestion?.id);
+  // Always resolve effectiveQ to an object that IS in the current questions array.
+  // Stale refs (e.g. after a save that re-issues Firestore IDs) would otherwise give effectiveIdx = -1.
+  const effectiveQ = (() => {
+    const pref = qTabSelectedQ || currentQuestion;
+    if (pref?.id) {
+      const matched = questions.find(q => q.id === pref.id);
+      if (matched) return matched;
+    }
+    return questions[0] || null;
+  })();
+  const effectiveIdx = effectiveQ ? questions.findIndex(q => q.id === effectiveQ.id) : -1;
+  const isEffectiveLive = !!(effectiveQ && poll.current_question_id === effectiveQ.id);
+  const effectiveResps = isEffectiveLive ? responses : (effectiveQ ? (allResponses[effectiveQ.id] || []) : []);
 
   const filteredQuestions = questions
     .map((q, idx) => ({ ...q, questionNumber: idx + 1, originalIndex: idx }))
@@ -913,8 +899,11 @@ export default function HostLive() {
         </div>
       )}
 
-      {/* Join Info Banner */}
-      <div className="join-banner">
+      {/* Sticky top section — join banner + projector controls */}
+      <div style={{ position: 'sticky', top: '64px', zIndex: 90, background: 'var(--bg-dark, #f1f5f9)', paddingBottom: '0.25rem' }}>
+
+      {/* Join Info Banner + participation count */}
+      <div className="join-banner" style={{ marginBottom: showQR ? '0' : '0.75rem', borderRadius: showQR ? 'var(--radius-lg) var(--radius-lg) 0 0' : undefined }}>
         <div className="join-banner-info">
           <h2>Audience Join Link</h2>
           <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
@@ -924,24 +913,188 @@ export default function HostLive() {
             </button>
           </div>
         </div>
-        <div style={{ textAlign: 'right' }}>
+        <div style={{ textAlign: 'center' }}>
           <h2>Join Code</h2>
           <span className="join-banner-code">{poll.join_code}</span>
         </div>
+        <div style={{ textAlign: 'center', borderLeft: '1px solid var(--border-color)', paddingLeft: '1.5rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', justifyContent: 'center', marginBottom: '0.15rem' }}>
+            <Users size={13} color="var(--color-accent)" />
+            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', fontWeight: 600 }}>Connected</span>
+          </div>
+          <div style={{ fontSize: '2rem', fontWeight: 800, lineHeight: 1 }}>{participantCount}</div>
+          <button className="btn btn-secondary btn-sm" style={{ marginTop: '0.4rem', fontSize: '0.7rem', padding: '0.18rem 0.55rem' }}
+            onClick={() => setShowQR(v => !v)}>
+            {showQR ? '✕ Hide QR' : '📱 QR'}
+          </button>
+        </div>
       </div>
+      {showQR && (
+        <div style={{ marginBottom: '0.75rem', padding: '1rem', background: 'var(--bg-card,#fff)', borderRadius: '0 0 var(--radius-lg) var(--radius-lg)', textAlign: 'center', border: '1px solid var(--border-color)', borderTop: 'none' }}>
+          <img
+            src={`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(`${window.location.origin}/join/${poll.join_code}`)}&bgcolor=ffffff&color=000000&margin=10`}
+            alt="QR" style={{ width: '200px', borderRadius: '8px', border: '1px solid var(--border-color)' }}
+          />
+          <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '0.5rem' }}>
+            Scan to join · Code: <strong style={{ color: 'var(--color-primary)' }}>{poll.join_code}</strong>
+          </p>
+        </div>
+      )}
 
-      {/* Layout Split */}
+      {/* Projector Controls */}
+      <div className="glass-card" style={{ padding: '1rem 1.25rem', marginBottom: projectorTab === 'question' ? '0.6rem' : '1.5rem' }}>
+        {/* Tab bar */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: projectorTab !== 'home' ? '0.9rem' : 0, flexWrap: 'wrap' }}>
+          <Monitor size={15} color="var(--color-accent)" style={{ flexShrink: 0 }} />
+          <div style={{ display: 'flex', gap: '0.3rem', flex: 1, flexWrap: 'wrap' }}>
+            {[['home','Home'],['question','Question'],['results','Results'],['leaderboard','Leaderboard']].map(([id2, label]) => (
+              <button key={id2} className={`btn btn-sm ${projectorTab === id2 ? 'btn-primary' : 'btn-secondary'}`}
+                style={{ fontSize: '0.8rem', padding: '0.28rem 0.7rem' }}
+                onClick={() => handleSetProjectorTab(id2)}>
+                {label}
+              </button>
+            ))}
+          </div>
+          <button className="btn btn-sm btn-secondary"
+            onClick={() => window.open(`/polls/${id}/projector`, '_blank')}
+            style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', flexShrink: 0, fontSize: '0.8rem' }}>
+            <ExternalLink size={12} /> Open Screen
+          </button>
+        </div>
+
+        {/* Question tab — numbered buttons only; detail card shown below */}
+        {projectorTab === 'question' && (
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.28rem', alignContent: 'flex-start', maxHeight: '136px', overflowY: 'auto' }}>
+            {questions.map((q, idx) => {
+              const isLive = poll.current_question_id === q.id;
+              const isDone = completedQIds.has(q.id);
+              const isSel = effectiveQ?.id === q.id;
+              const canClick = isLive || isDone;
+              return (
+                <button key={q.id} title={q.text}
+                  onClick={() => canClick ? handleQTabSelectQuestion(q) : undefined}
+                  style={{ width: '46px', height: '42px', borderRadius: '10px', padding: '2px 4px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '1px', fontWeight: 700, transition: 'all 0.12s', cursor: canClick ? 'pointer' : 'default', background: isSel ? '#2B5FD9' : isLive ? 'rgba(220,42,60,0.07)' : isDone ? 'rgba(34,197,94,0.08)' : 'var(--bg-card,#fff)', color: isSel ? '#fff' : isLive ? '#DC2A3C' : isDone ? '#16A34A' : 'var(--text-muted)', border: `1.5px solid ${isSel ? '#2B5FD9' : isLive ? '#DC2A3C' : isDone ? '#16A34A' : 'var(--border-color)'}`, opacity: !canClick && !isSel ? 0.28 : 1, boxShadow: isSel ? '0 2px 8px rgba(43,95,217,0.25)' : 'none' }}>
+                  <span style={{ fontSize: '0.82rem', lineHeight: 1 }}>{idx + 1}</span>
+                  {isLive  && <span style={{ fontSize: '0.42rem', lineHeight: 1, letterSpacing: '0.04em' }}>LIVE</span>}
+                  {isDone && !isLive && !isSel && <span style={{ fontSize: '0.42rem', lineHeight: 1 }}>DONE</span>}
+                  {isSel  && !isLive && <span style={{ fontSize: '0.42rem', lineHeight: 1, opacity: 0.7 }}>SEL</span>}
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Results tab */}
+        {projectorTab === 'results' && (() => {
+          if (!currentQuestion) return <p style={{ fontSize: '0.83rem', color: 'var(--text-secondary)' }}>No question selected.</p>;
+          if (currentQuestion.type !== 'multiple_choice') return <p style={{ fontSize: '0.83rem', color: 'var(--text-secondary)' }}>Results reveal works for multiple choice questions.</p>;
+          const options = currentQuestion.options || [];
+          const tallies = {};
+          options.forEach(o => { tallies[o] = 0; });
+          responses.forEach(r => {
+            (r.answer || '').split(',').map(s => s.trim()).filter(Boolean).forEach(a => {
+              if (tallies[a] !== undefined) tallies[a]++;
+            });
+          });
+          const totalVotes = responses.length;
+          const sortedOpts = options.slice().sort((a, b) => {
+            const diff = (tallies[b] || 0) - (tallies[a] || 0);
+            return diff !== 0 ? diff : options.indexOf(a) - options.indexOf(b);
+          });
+          const qId = currentQuestion.id;
+          const reveals = (poll.projector_reveals || {})[qId] || options.map(() => false);
+          const revealCount = reveals.filter(Boolean).length;
+          return (
+            <div>
+              <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center', marginBottom: '0.65rem', flexWrap: 'wrap' }}>
+                <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', flex: 1 }}>
+                  <strong>Q{currentIndex + 1}</strong> · {revealCount}/{Math.min(sortedOpts.length, 10)} revealed
+                </span>
+                <button className="btn btn-sm btn-success" onClick={handleRevealNext} disabled={revealCount >= Math.min(sortedOpts.length, 10)} style={{ fontSize: '0.78rem' }}>
+                  Reveal Next #{revealCount + 1}
+                </button>
+                <button className="btn btn-sm btn-secondary" onClick={handleHideAllReveals} disabled={revealCount === 0} style={{ fontSize: '0.78rem' }}>
+                  Hide All
+                </button>
+              </div>
+              {sortedOpts.slice(0, 10).map((opt, rankPos) => {
+                const optIdx = options.indexOf(opt);
+                const votes = tallies[opt] || 0;
+                const pct = totalVotes > 0 ? Math.round(votes / totalVotes * 100) : 0;
+                const isRevealed = reveals[optIdx] === true;
+                return (
+                  <div key={opt} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.38rem 0.6rem', marginBottom: '0.22rem', borderRadius: '8px', background: isRevealed ? 'rgba(34,197,94,0.05)' : 'rgba(0,0,0,0.02)', border: `1px solid ${isRevealed ? 'rgba(34,197,94,0.2)' : 'var(--border-color)'}` }}>
+                    <span style={{ fontSize: '0.7rem', fontWeight: 700, color: 'var(--text-muted)', width: '18px', flexShrink: 0 }}>#{rankPos + 1}</span>
+                    <span style={{ flex: 1, fontSize: '0.82rem', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{opt}</span>
+                    <span style={{ fontSize: '0.78rem', fontWeight: 700, color: 'var(--color-accent)', flexShrink: 0 }}>{votes} ({pct}%)</span>
+                    <button className={`btn btn-sm ${isRevealed ? 'btn-secondary' : 'btn-success'}`}
+                      style={{ padding: '0.15rem 0.45rem', fontSize: '0.7rem', flexShrink: 0 }}
+                      onClick={() => handleToggleReveal(optIdx)}>
+                      {isRevealed ? 'Hide' : 'Reveal'}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          );
+        })()}
+
+        {/* Leaderboard tab */}
+        {projectorTab === 'leaderboard' && (
+          <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap' }}>
+            <button className={`btn btn-sm ${projectorLbRange === -1 ? 'btn-primary' : 'btn-secondary'}`} style={{ fontSize: '0.78rem' }}
+              onClick={() => {
+                setProjectorLbRange(-1);
+                updateLeaderboard(poll.id).catch(() => {});
+                const m = 'leaderboard_overall';
+                setPoll(p => ({ ...p, projector_mode: m }));
+                updatePoll(poll.id, { projector_mode: m }).catch(console.error);
+              }}>Overall</button>
+            {Array.from({ length: Math.ceil(questions.length / 10) }, (_, i) => (
+              <button key={i} className={`btn btn-sm ${projectorLbRange === i ? 'btn-primary' : 'btn-secondary'}`} style={{ fontSize: '0.78rem' }}
+                onClick={() => {
+                  setProjectorLbRange(i);
+                  updateLeaderboard(poll.id).catch(() => {});
+                  const m = `leaderboard_range_${i}`;
+                  setPoll(p => ({ ...p, projector_mode: m }));
+                  updatePoll(poll.id, { projector_mode: m }).catch(console.error);
+                }}>
+                Q{i * 10 + 1}–{Math.min((i + 1) * 10, questions.length)}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      </div>{/* /sticky wrapper */}
+
+      {/* Home tab — status info card */}
+      {projectorTab === 'home' && poll.status !== 'draft' && (
+        <div className="glass-card" style={{ padding: '2rem', marginBottom: '1.5rem', textAlign: 'center' }}>
+          <h3 style={{ marginBottom: '0.55rem' }}>Event banner is on screen</h3>
+          <p style={{ color: 'var(--text-secondary)', maxWidth: '500px', margin: '0 auto', lineHeight: 1.6 }}>
+            The projector shows the <strong>{poll.title}</strong> banner with the join link, and players see the waiting screen. Switch to <strong>Question</strong> when you&apos;re ready to play.
+          </p>
+        </div>
+      )}
+
+      {/* Layout Split — visible for Question tab only */}
+      {projectorTab === 'question' && (
       <div className="live-layout">
-        
+
         {/* Main projection pane */}
         <div className="glass-card" style={{ padding: '2.5rem' }}>
           {poll.status === 'draft' ? (
             <div>
-              <div style={{ marginBottom: '1.5rem' }}>
-                <h2>Edit Event Title & Questions</h2>
-                <p style={{ margin: '0.5rem 0 0', color: 'var(--text-secondary)' }}>
-                  Add questions now, save the draft, and start the live session when you're ready. You can edit questions individually before launch.
-                </p>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1.5rem', gap: '1rem' }}>
+                <div>
+                  <h2 style={{ margin: 0 }}>Edit Event Title &amp; Questions</h2>
+                  <p style={{ margin: '0.5rem 0 0', color: 'var(--text-secondary)' }}>
+                    Add questions, then launch the live session when ready.
+                  </p>
+                </div>
+                <button className="btn btn-success" style={{ flexShrink: 0 }} onClick={handleStartPoll} disabled={questions.length === 0 || savingDraft || loading}>
+                  <Play size={16} /> Start Poll Session
+                </button>
               </div>
 
               <div className="form-group">
@@ -1176,9 +1329,6 @@ export default function HostLive() {
                     <button className="btn btn-secondary" onClick={handleSaveDraft} disabled={savingDraft || loading}>
                       <Save size={16} /> Save Draft
                     </button>
-                    <button className="btn btn-success" onClick={handleStartPoll} disabled={questions.length === 0 || savingDraft || loading}>
-                      <Play size={16} /> Start Poll Session
-                    </button>
                   </div>
 
                   {saveMessage && (
@@ -1189,143 +1339,66 @@ export default function HostLive() {
                 </div>
               )}
             </div>
-          ) : currentQuestion ? (
+          ) : effectiveQ ? (
             <div>
               {poll.status === 'ended' && (
-                <div style={{ marginBottom: '1.5rem', padding: '1rem 1.25rem', borderRadius: '16px', background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.2)', color: 'var(--color-success)' }}>
-                  <strong>Session ended.</strong> You can still review responses for any question below.
+                <div style={{ marginBottom: '1rem', padding: '0.75rem 1rem', borderRadius: '12px', background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.2)', color: 'var(--color-success)', fontSize: '0.88rem' }}>
+                  <strong>Session ended.</strong> You can still review responses for any question.
                 </div>
               )}
-            <div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--border-color)', paddingBottom: '1rem', marginBottom: '2rem' }}>
-                <div>
-                  <span className="question-number">Question {currentIndex + 1} of {questions.length}</span>
-                  <h2 style={{ marginTop: '0.5rem', marginBottom: 0 }}>{currentQuestion.text}</h2>
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', background: 'rgba(255, 255, 255, 0.03)', padding: '0.5rem 1rem', borderRadius: '30px', border: '1px solid var(--border-color)' }}>
-                  <Users size={16} color="var(--color-accent)" />
-                  <span style={{ fontSize: '0.9rem', fontWeight: 600 }}>{responses.length} responses</span>
-                </div>
+              {/* Top row: timer / start | responses | prev/next nav */}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
                 <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-                  {poll.status === 'active' && !poll.current_question_id && (
-                    <button className="btn btn-success" onClick={() => handleStartQuestion(currentQuestion)}>
-                      Start Question
+                  {isEffectiveLive && questionCountdown > 0 && (
+                    <div style={{ padding: '0.4rem 0.75rem', borderRadius: '10px', background: 'rgba(124,58,237,0.08)', border: '1px solid rgba(124,58,237,0.2)', fontWeight: 700, fontSize: '0.9rem', color: 'var(--color-primary)' }}>
+                      ⏱ {questionCountdown}s
+                    </div>
+                  )}
+                  {/* Start Question — only for Q1, only before it has been answered */}
+                  {poll.status === 'active' && !poll.current_question_id && effectiveIdx === 0 && !(allResponses[effectiveQ?.id]?.length > 0) && (
+                    <button className="btn btn-success btn-sm" onClick={() => handleStartQuestion(effectiveQ)}>
+                      <Play size={14} /> Start Question
                     </button>
                   )}
-                  {questionCountdown > 0 && (
-                    <div style={{ padding: '0.5rem 0.75rem', borderRadius: '12px', background: 'rgba(255,255,255,0.03)', fontWeight: 700 }}>
-                      Time left: {questionCountdown}s
-                    </div>
-                  )}
                 </div>
-              </div>
-
-              {/* Show different visualization based on question type */}
-              {currentQuestion.type === 'multiple_choice' && renderMCResults()}
-              {currentQuestion.type === 'rating' && renderRatingResults()}
-              {currentQuestion.type === 'open_text' && renderOpenTextResults()}
-
-              {/* Leaderboard controls & displays */}
-              <div style={{ marginTop: '1.5rem', marginBottom: '1.5rem' }}>
                 <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-                  <button className="btn btn-secondary" onClick={() => showLeaderboardForRange(0)}>
-                    Show First 10 Leaderboard
-                  </button>
-                  <button className="btn btn-secondary" onClick={showOverall}>
-                    Show Overall Leaderboard
-                  </button>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', padding: '0.35rem 0.75rem', borderRadius: '20px', background: 'rgba(8,145,178,0.06)', border: '1px solid var(--border-color)', fontSize: '0.85rem', fontWeight: 600 }}>
+                    <Users size={14} color="var(--color-accent)" />
+                    {effectiveResps.length} response{effectiveResps.length !== 1 ? 's' : ''}
+                  </div>
+                  {/* Prev / Next navigation — Next actually starts the next question */}
+                  <div style={{ display: 'flex', gap: '0.25rem' }}>
+                    <button className="btn btn-secondary btn-sm" style={{ padding: '0.3rem 0.55rem' }}
+                      onClick={() => effectiveIdx > 0 && handleQTabSelectQuestion(questions[effectiveIdx - 1])}
+                      disabled={effectiveIdx <= 0} title="Previous question (view only)">
+                      <ChevronLeft size={14} />
+                    </button>
+                    <button className="btn btn-success btn-sm"
+                      onClick={() => effectiveIdx < questions.length - 1 && handleStartQuestion(questions[effectiveIdx + 1])}
+                      disabled={effectiveIdx >= questions.length - 1 || poll.status !== 'active'}>
+                      Next <ChevronRight size={14} />
+                    </button>
+                  </div>
                 </div>
-
-                {showRangeLeaderboard && (
-                  <div style={{ marginTop: '1rem' }}>
-                    <h4 style={{ marginBottom: '0.5rem' }}>Leaderboard (range)</h4>
-                    {rangeLeaderboard.length === 0 ? <div>No scores yet.</div> : (
-                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '12px' }}>
-                        {rangeLeaderboard.map((p, idx) => (
-                          <div key={p.participant_id} className={`mc-option-button`} style={{ padding: '12px', display: 'flex', alignItems: 'center', gap: '12px' }}>
-                            <div style={{ width: 44, height: 44, borderRadius: 44, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--color-accent)', color: '#fff', fontWeight: 800, fontSize: '1rem' }}>{idx + 1}</div>
-                            <div style={{ flex: 1, minWidth: 0 }}>
-                              <div style={{ fontWeight: 700, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name || 'Anonymous'}</div>
-                              <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>{p.phone || p.participant_id || '—'}</div>
-                            </div>
-                            <div style={{ textAlign: 'right' }}>
-                              <div style={{ fontWeight: 800, fontSize: '1.1rem' }}>{p.points}</div>
-                              <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>pts</div>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                    <div style={{ marginTop: '0.75rem' }}>
-                      <button className="btn btn-secondary btn-sm" onClick={() => setShowRangeLeaderboard(false)}>Close</button>
-                    </div>
-                  </div>
-                )}
-
-                {showOverallLeaderboard && (
-                  <div style={{ marginTop: '1rem' }}>
-                    <h4 style={{ marginBottom: '0.5rem' }}>Overall Leaderboard</h4>
-                    {overallLeaderboard.length === 0 ? <div>No scores yet.</div> : (
-                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '12px' }}>
-                        {overallLeaderboard.map((p, idx) => (
-                          <div key={p.participant_id} className={`mc-option-button`} style={{ padding: '12px', display: 'flex', alignItems: 'center', gap: '12px' }}>
-                            <div style={{ width: 44, height: 44, borderRadius: 44, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--color-accent)', color: '#fff', fontWeight: 800, fontSize: '1rem' }}>{idx + 1}</div>
-                            <div style={{ flex: 1, minWidth: 0 }}>
-                              <div style={{ fontWeight: 700, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{p.name || 'Anonymous'}</div>
-                              <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>{p.phone || p.participant_id || '—'}</div>
-                            </div>
-                            <div style={{ textAlign: 'right' }}>
-                              <div style={{ fontWeight: 800, fontSize: '1.1rem' }}>{p.points}</div>
-                              <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>pts</div>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                    <div style={{ marginTop: '0.75rem' }}>
-                      <button className="btn btn-secondary btn-sm" onClick={() => setShowOverallLeaderboard(false)}>Close</button>
-                    </div>
-                  </div>
-                )}
               </div>
 
-              {/* Back/Next Controls */}
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '3rem', borderTop: '1px solid var(--border-color)', paddingTop: '1.5rem' }}>
-                <button 
-                  className="btn btn-secondary" 
-                  onClick={handlePrevQuestion} 
-                  disabled={!currentQuestion || questions.length <= 1 || currentIndex === 0}
-                >
-                  <ChevronLeft size={16} /> Previous Question
-                </button>
-                <button 
-                  className="btn btn-secondary" 
-                  onClick={handleNextQuestion} 
-                  disabled={!currentQuestion || questions.length <= 1 || currentIndex === questions.length - 1}
-                >
-                  Next Question <ChevronRight size={16} />
-                </button>
+              {/* Question heading */}
+              <div style={{ borderBottom: '1px solid var(--border-color)', paddingBottom: '1rem', marginBottom: '1.5rem' }}>
+                <span className="question-number">Question {effectiveIdx + 1} of {questions.length}</span>
+                <h2 style={{ marginTop: '0.35rem', marginBottom: 0 }}>{effectiveQ.text}</h2>
               </div>
-           </div>
+
+              {/* Results visualisation */}
+              {renderForQ(effectiveQ, effectiveResps)}
+
             </div>
           ) : (
-            <div style={{ textAlign: 'center', padding: '3rem 0' }}>
-              <p>No questions found. Add questions by editing this poll.</p>
-            </div>
+            <div style={{ textAlign: 'center', padding: '3rem 0', color: 'var(--text-secondary)' }}>No questions yet.</div>
           )}
         </div>
 
-        {/* Sidebar question manager */}
+        {/* Sidebar — Questions Navigator */}
         <div className="live-sidebar">
-          <div className="glass-card" style={{ padding: '1.5rem' }}>
-            <h3 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '1.5rem', fontSize: '1.1rem' }}>
-              <Users size={18} color="var(--text-secondary)" />
-              Participants Connected
-            </h3>
-            <div style={{ fontSize: '2rem', fontWeight: 800 }}>{participantCount}</div>
-            <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Audience members currently in the room</p>
-          </div>
-
           <div className="glass-card" style={{ padding: '1.5rem', display: 'flex', flexDirection: 'column', gap: '1rem', flex: 1 }}>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
               <h3 style={{ fontSize: '1.1rem', borderBottom: '1px solid var(--border-color)', paddingBottom: '0.5rem' }}>Questions Navigator</h3>
@@ -1346,18 +1419,24 @@ export default function HostLive() {
                 </div>
               ) : (
                 filteredQuestions.map((q) => {
-                  const isActive = q.id === currentQuestion?.id;
+                  const isViewing = q.id === effectiveQ?.id;
+                  const isLiveQ = q.id === currentQuestion?.id && !!poll.current_question_id;
+                  const hasResponses = (allResponses[q.id]?.length ?? 0) > 0;
                   const isPollInteractive = poll.status === 'active' || poll.status === 'ended';
                   return (
                     <button
                       key={q.id}
-                      className={`live-nav-btn ${isActive ? 'active' : ''}`}
-                      onClick={() => handleSetActiveQuestion(q)}
-                      disabled={!isPollInteractive}
-                      title={!isPollInteractive ? 'Start the session to navigate questions' : ''}
+                      className={`live-nav-btn ${isViewing ? 'active' : ''}`}
+                      onClick={() => handleQTabSelectQuestion(q)}
+                      disabled={!isPollInteractive || !hasResponses}
+                      title={!hasResponses ? 'No responses yet — start this question to enable' : ''}
                     >
                       <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
-                        <span style={{ fontSize: '0.75rem', textTransform: 'uppercase', fontWeight: 700 }}>Question {q.questionNumber}</span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                          <span style={{ fontSize: '0.75rem', textTransform: 'uppercase', fontWeight: 700 }}>Question {q.questionNumber}</span>
+                          {isLiveQ && <span style={{ fontSize: '0.6rem', fontWeight: 700, color: '#fff', background: '#DC2A3C', borderRadius: '4px', padding: '1px 5px', lineHeight: 1.4 }}>LIVE</span>}
+                          {hasResponses && !isLiveQ && <span style={{ fontSize: '0.6rem', fontWeight: 700, color: '#16A34A', background: 'rgba(34,197,94,0.12)', border: '1px solid rgba(34,197,94,0.25)', borderRadius: '4px', padding: '1px 5px', lineHeight: 1.4 }}>✓</span>}
+                        </div>
                         <span style={{ fontSize: '0.9rem', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
                           {q.text}
                         </span>
@@ -1370,6 +1449,8 @@ export default function HostLive() {
         </div>
 
       </div>
+      )}
+
     </div>
   );
 }

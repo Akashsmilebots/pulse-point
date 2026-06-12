@@ -24,6 +24,10 @@ export const generateJoinCode = () => {
 
 // Get or create host identifier
 export const getHostId = () => {
+  const hostPhone = localStorage.getItem('pulsepoint_host_phone');
+  if (hostPhone) {
+    return hostPhone;
+  }
   let hostId = localStorage.getItem('pulsepoint_host_id');
   if (!hostId) {
     hostId = generateUUID();

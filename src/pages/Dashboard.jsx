@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { supabase } from '../supabaseClient';
+import { getPollsForHost, deletePoll, auth, syncHostAuthUid } from '../lib/firebase';
 import { getHostId } from '../utils';
 import { Plus, Edit3, Trash2, Copy, Play, Check } from 'lucide-react';
 
@@ -11,53 +11,44 @@ export default function Dashboard() {
   const navigate = useNavigate();
   const hostId = getHostId();
 
-  useEffect(() => {
-    fetchPolls();
-  }, []);
+  const username = localStorage.getItem('pulsepoint_host_username');
+  const phone = localStorage.getItem('pulsepoint_host_phone');
 
-  const fetchPolls = async () => {
+  async function fetchPolls() {
     try {
       setLoading(true);
-      // Fetch ALL polls so they appear on every device/environment
-      const { data, error } = await supabase
-        .from('polls')
-        .select(`
-          id,
-          title,
-          join_code,
-          host_id,
-          status,
-          created_at,
-          questions:questions!questions_poll_id_fkey (
-            id
-          )
-        `)
-        .order('created_at', { ascending: false });
-
-      if (error) throw error;
+      const anonUid = auth.currentUser ? auth.currentUser.uid : null;
+      const data = await getPollsForHost(hostId, anonUid);
       setPolls(data || []);
     } catch (err) {
       console.error('Error fetching polls:', err);
     } finally {
       setLoading(false);
     }
-  };
+  }
+
+  useEffect(() => {
+    if (!username || !phone) {
+      navigate('/host/login');
+      return;
+    }
+    // Sync the host anonymous auth UID to their phone identifier
+    syncHostAuthUid(username, phone);
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    fetchPolls();
+  }, [username, phone, navigate]);
 
   const handleDelete = async (poll) => {
-    if (poll.host_id !== hostId) {
-      alert('You can only delete polls you created in this browser.');
+    const isMyPoll = poll.host_id === (auth.currentUser ? auth.currentUser.uid : null) || poll.host_id === hostId;
+    if (!isMyPoll) {
+      alert('You can only delete polls you created.');
       return;
     }
     if (!window.confirm('Are you sure you want to delete this poll and all its responses? This cannot be undone.')) {
       return;
     }
     try {
-      const { error } = await supabase
-        .from('polls')
-        .delete()
-        .eq('id', poll.id);
-
-      if (error) throw error;
+      await deletePoll(poll.id);
       setPolls(polls.filter(p => p.id !== poll.id));
     } catch (err) {
       console.error('Error deleting poll:', err);
@@ -74,7 +65,7 @@ export default function Dashboard() {
 
   const totalPolls = polls.length;
   const activePollsCount = polls.filter(p => p.status === 'active').length;
-  const myPollsCount = polls.filter(p => p.host_id === hostId).length;
+  const myPollsCount = polls.filter(p => p.host_id === hostId || p.host_id === (auth.currentUser ? auth.currentUser.uid : null)).length;
 
   return (
     <div>
@@ -119,8 +110,8 @@ export default function Dashboard() {
       ) : (
         <div className="polls-grid">
           {polls.map((poll) => {
-            const questionCount = poll.questions ? poll.questions.length : 0;
-            const isMyPoll = poll.host_id === hostId;
+            const questionCount = poll.question_count ?? (poll.questions ? poll.questions.length : 0);
+            const isMyPoll = poll.host_id === hostId || poll.host_id === (auth.currentUser ? auth.currentUser.uid : null);
             return (
               <div className="glass-card poll-card" key={poll.id}>
                 <div className="poll-card-header">

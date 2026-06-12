@@ -1,8 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { supabase } from '../supabaseClient';
-import { generateUUID, getParticipantSessionId, getParticipantName, setParticipantName } from '../utils';
-import { LogIn, ArrowRight } from 'lucide-react';
+import { getPollByJoinCode, checkPhoneRegistration, registerParticipant } from '../lib/firebase';
+import { getParticipantSessionId, getParticipantName, generateUUID, setParticipantName } from '../utils';
+import { ArrowRight } from 'lucide-react';
 
 export default function ParticipantJoin() {
   const { code } = useParams();
@@ -17,42 +17,38 @@ export default function ParticipantJoin() {
   const [error, setError] = useState('');
 
   useEffect(() => {
+    const fetchPollDetails = async () => {
+      try {
+        setLoading(true);
+        const data = await getPollByJoinCode(code.toUpperCase());
+
+        if (!data) {
+          setError('Poll code is invalid. Please double check and try again.');
+          return;
+        }
+
+        if (data.status === 'ended') {
+          setError('This poll has already ended.');
+          return;
+        }
+
+        setPoll(data);
+
+        // Pre-fill name if they previously joined this poll
+        const existingName = getParticipantName(data.id);
+        if (existingName) {
+          setName(existingName);
+        }
+      } catch (err) {
+        console.error(err);
+        setError('An error occurred. Please try again.');
+      } finally {
+        setLoading(false);
+      }
+    };
+
     fetchPollDetails();
   }, [code]);
-
-  const fetchPollDetails = async () => {
-    try {
-      setLoading(true);
-      const { data, error: fetchError } = await supabase
-        .from('polls')
-        .select('*')
-        .eq('join_code', code.toUpperCase())
-        .single();
-
-      if (fetchError || !data) {
-        setError('Poll code is invalid. Please double check and try again.');
-        return;
-      }
-
-      if (data.status === 'ended') {
-        setError('This poll has already ended.');
-        return;
-      }
-
-      setPoll(data);
-
-      // Pre-fill name if they previously joined this poll
-      const existingName = getParticipantName(data.id);
-      if (existingName) {
-        setName(existingName);
-      }
-    } catch (err) {
-      console.error(err);
-      setError('An error occurred. Please try again.');
-    } finally {
-      setLoading(false);
-    }
-  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -81,35 +77,20 @@ export default function ParticipantJoin() {
     setError('');
 
     try {
-      const { data: existingPhone, error: phoneError } = await supabase
-        .from('participants')
-        .select('id, session_id')
-        .eq('poll_id', poll.id)
-        .eq('phone', cleanedPhone)
-        .maybeSingle();
+      const existingPhone = await checkPhoneRegistration(poll.id, cleanedPhone);
 
-      if (phoneError) throw phoneError;
       if (existingPhone && existingPhone.session_id !== finalSessionId) {
         setError('This phone number is already registered for this event.');
         setSubmitting(false);
         return;
       }
 
-      const { data: participant, error: pError } = await supabase
-        .from('participants')
-        .upsert(
-          {
-            poll_id: poll.id,
-            name: name.trim(),
-            phone: cleanedPhone,
-            session_id: finalSessionId
-          },
-          { onConflict: 'poll_id,session_id' }
-        )
-        .select()
-        .single();
-
-      if (pError) throw pError;
+      await registerParticipant(
+        poll.id,
+        name.trim(),
+        cleanedPhone,
+        finalSessionId
+      );
 
       setParticipantName(poll.id, name.trim());
       navigate(`/poll/${code}/play`);

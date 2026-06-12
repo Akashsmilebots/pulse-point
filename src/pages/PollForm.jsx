@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { supabase } from '../supabaseClient';
+import { getPollById, getPollByJoinCode, createPoll, updatePoll, auth, hasValidConfig } from '../lib/firebase';
 import { getHostId, generateJoinCode } from '../utils';
 import { ArrowLeft, Save } from 'lucide-react';
 
@@ -14,37 +14,59 @@ export default function PollForm() {
   const [loading, setLoading] = useState(false);
   const [fetching, setFetching] = useState(isEdit);
 
+  const username = localStorage.getItem('pulsepoint_host_username');
+  const phone = localStorage.getItem('pulsepoint_host_phone');
+
   useEffect(() => {
+    if (!username || !phone) {
+      navigate('/host/login');
+      return;
+    }
+
+    const fetchPollData = async () => {
+      try {
+        // Fetch poll details first (without enforcing host_id inside the query)
+        const poll = await getPollById(id);
+
+        if (!poll) {
+          alert('Poll not found.');
+          navigate('/dashboard');
+          return;
+        }
+
+        // Wait for Firebase Auth to be ready
+        let currentUser = auth.currentUser;
+        if (!currentUser && hasValidConfig) {
+          currentUser = await new Promise((resolve) => {
+            const unsubscribe = auth.onAuthStateChanged((user) => {
+              unsubscribe();
+              resolve(user);
+            });
+          });
+        }
+
+        const effectiveHostId = currentUser ? currentUser.uid : hostId;
+
+        // Verify ownership
+        if (poll.host_id !== effectiveHostId && poll.host_id !== hostId) {
+          alert('Unauthorized to edit this poll.');
+          navigate('/dashboard');
+          return;
+        }
+
+        setTitle(poll.title);
+      } catch (err) {
+        console.error(err);
+        alert('Failed to load poll details.');
+      } finally {
+        setFetching(false);
+      }
+    };
+
     if (isEdit) {
       fetchPollData();
     }
-  }, [id]);
-
-  const fetchPollData = async () => {
-    try {
-      // Fetch poll details
-      const { data: poll, error: pollError } = await supabase
-        .from('polls')
-        .select('*')
-        .eq('id', id)
-        .eq('host_id', hostId)
-        .single();
-
-      if (pollError || !poll) {
-        console.error('Error fetching poll:', pollError);
-        alert('Poll not found or unauthorized.');
-        navigate('/dashboard');
-        return;
-      }
-
-      setTitle(poll.title);
-    } catch (err) {
-      console.error(err);
-      alert('Failed to load poll details.');
-    } finally {
-      setFetching(false);
-    }
-  };
+  }, [id, username, phone, navigate, isEdit, hostId]);
 
   const handleSave = async (e) => {
     e.preventDefault();
@@ -65,35 +87,14 @@ export default function PollForm() {
 
         while (exists) {
           uniqueCode = generateJoinCode();
-          const { data } = await supabase
-            .from('polls')
-            .select('id')
-            .eq('join_code', uniqueCode)
-            .maybeSingle();
+          const data = await getPollByJoinCode(uniqueCode);
           if (!data) exists = false;
         }
 
-        const { data: newPoll, error: pollError } = await supabase
-          .from('polls')
-          .insert({
-            title: title.trim(),
-            join_code: uniqueCode,
-            host_id: hostId,
-            status: 'draft'
-          })
-          .select()
-          .single();
-
-        if (pollError) throw pollError;
+        const newPoll = await createPoll(title.trim(), hostId, uniqueCode);
         pollId = newPoll.id;
       } else {
-        const { error: pollError } = await supabase
-          .from('polls')
-          .update({ title: title.trim() })
-          .eq('id', pollId)
-          .eq('host_id', hostId);
-
-        if (pollError) throw pollError;
+        await updatePoll(pollId, { title: title.trim() });
       }
 
       navigate(`/polls/${pollId}/host`);

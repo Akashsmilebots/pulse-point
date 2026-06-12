@@ -1,8 +1,31 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { supabase } from '../supabaseClient';
+
+// Deterministic Fisher-Yates shuffle seeded by a string (e.g. sessionId + questionId)
+function seededShuffle(arr, seedStr) {
+  const a = [...arr];
+  let seed = 0;
+  for (let i = 0; i < seedStr.length; i++) {
+    seed = Math.imul(seed ^ seedStr.charCodeAt(i), 0x5bd1e995);
+    seed ^= seed >>> 13;
+  }
+  for (let i = a.length - 1; i > 0; i--) {
+    seed = (Math.imul(seed, 1664525) + 1013904223) | 0;
+    const j = Math.abs(seed) % (i + 1);
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+import {
+  getPollByJoinCode,
+  getParticipant,
+  getQuestionById,
+  getResponseForParticipant,
+  submitResponse,
+  subscribeToPoll
+} from '../lib/firebase';
 import { getParticipantSessionId } from '../utils';
-import { Check, Star, RefreshCw, Send, AlertTriangle } from 'lucide-react';
+import { Check, RefreshCw, AlertTriangle } from 'lucide-react';
 
 export default function ParticipantPlay() {
   const { code } = useParams();
@@ -24,62 +47,73 @@ export default function ParticipantPlay() {
   const localTimerRef = useRef(null);
   const userResponseRef = useRef(null);
   const submittingRef = useRef(false);
-  const currentQuestionRef = useRef(null);
-
   const currentQuestionIdRef = useRef(null);
+  // Stable refs so async callbacks never read stale state
+  const pollIdRef = useRef(null);
+  const participantIdRef = useRef(null);
+
+  const fetchQuestionRef = useRef();
+  const handleSubmitAnswerRef = useRef();
+  const refreshPollStateRef = useRef();
+  // Set to true by the timer when it reaches 0; a useEffect triggers the actual submit
+  const timerExpiredRef = useRef(false);
+  // Holds question data for auto-submit even after currentQuestion state is cleared
+  const currentQuestionDataRef = useRef(null);
 
   useEffect(() => {
     fetchInitialState();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [code]);
 
   // Handle poll status and question changes in real-time
   useEffect(() => {
-    if (!poll) return;
+    if (!poll || !participant) return;
 
-    const pollChannel = supabase
-      .channel(`play-poll-${poll.id}`)
-      .on(
-        'postgres_changes',
-        { event: 'UPDATE', schema: 'public', table: 'polls', filter: `id=eq.${poll.id}` },
-        async (payload) => {
-          const updatedPoll = payload.new;
-          if (!updatedPoll) return;
+    const unsubscribe = subscribeToPoll(poll.id, async (updatedPoll) => {
+      setPoll(updatedPoll);
 
-          setPoll(updatedPoll);
+      if (updatedPoll.status === 'ended') {
+        currentQuestionIdRef.current = null;
+        setCurrentQuestion(null);
+        setUserResponse(null);
+        return;
+      }
 
-          if (updatedPoll.status === 'ended') {
-            currentQuestionIdRef.current = null;
-            setCurrentQuestion(null);
-            setUserResponse(null);
-            return;
-          }
-
-          const nextQuestionId = updatedPoll.current_question_id;
-          if (!nextQuestionId) {
-            currentQuestionIdRef.current = null;
-            setCurrentQuestion(null);
-            setUserResponse(null);
-            if (localTimerRef.current) {
-              clearInterval(localTimerRef.current);
-              localTimerRef.current = null;
-            }
-            return;
-          }
-
-          if (nextQuestionId !== currentQuestionIdRef.current) {
-            currentQuestionIdRef.current = nextQuestionId;
-            setCurrentQuestion(null);
-            setUserResponse(null);
-            await fetchQuestion(nextQuestionId);
-          }
+      const nextQuestionId = updatedPoll.current_question_id;
+      if (!nextQuestionId) {
+        currentQuestionIdRef.current = null;
+        setUserResponse(null);
+        userResponseRef.current = null;
+        // Keep question visible only while timer still ticks (so auto-submit can fire).
+        // If timer already stopped (submitted or expired), clear immediately.
+        if (!localTimerRef.current) {
+          setCurrentQuestion(null);
+          currentQuestionDataRef.current = null;
         }
-      )
-      .subscribe();
+        return;
+      }
+
+      if (nextQuestionId !== currentQuestionIdRef.current) {
+        // Clear old question immediately so stale content never shows
+        currentQuestionIdRef.current = nextQuestionId;
+        setCurrentQuestion(null);
+        setUserResponse(null);
+        userResponseRef.current = null;
+        currentQuestionDataRef.current = null;
+        // Stop any running timer before loading the new question
+        if (localTimerRef.current) {
+          clearInterval(localTimerRef.current);
+          localTimerRef.current = null;
+        }
+        await fetchQuestionRef.current(nextQuestionId);
+      }
+    });
 
     return () => {
-      supabase.removeChannel(pollChannel);
+      unsubscribe();
     };
-  }, [poll?.id]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [poll?.id, participant?.id]);
 
   useEffect(() => {
     return () => {
@@ -90,25 +124,33 @@ export default function ParticipantPlay() {
     };
   }, []);
 
-  const fetchInitialState = async () => {
+  // Auto-submit when countdown hits 0 — runs outside the state updater to avoid React Strict Mode double-calls
+  useEffect(() => {
+    if (localCountdown === 0 && timerExpiredRef.current) {
+      timerExpiredRef.current = false;
+      if (!userResponseRef.current && !submittingRef.current) {
+        handleSubmitAnswerRef.current(null);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [localCountdown]);
+
+  async function fetchInitialState() {
     try {
       setLoading(true);
       setError('');
 
       // 1. Fetch Poll
-      const { data: pollData, error: pollError } = await supabase
-        .from('polls')
-        .select('*')
-        .eq('join_code', code.toUpperCase())
-        .single();
+      const pollData = await getPollByJoinCode(code.toUpperCase());
 
-      if (pollError || !pollData) {
+      if (!pollData) {
         setError('Poll code is invalid.');
         setLoading(false);
         return;
       }
 
       setPoll(pollData);
+      pollIdRef.current = pollData.id; // set ref eagerly before any async call reads it
 
       if (pollData.status === 'ended') {
         setLoading(false);
@@ -116,24 +158,20 @@ export default function ParticipantPlay() {
       }
 
       // 2. Fetch Participant registration (verify they entered name)
-      const { data: participantData, error: pError } = await supabase
-        .from('participants')
-        .select('*')
-        .eq('poll_id', pollData.id)
-        .eq('session_id', sessionId)
-        .maybeSingle();
+      const participantData = await getParticipant(pollData.id, sessionId);
 
-      if (pError || !participantData) {
+      if (!participantData) {
         // Redirect back to join page
         navigate(`/join/${code}`);
         return;
       }
 
       setParticipant(participantData);
+      participantIdRef.current = participantData.id; // set ref eagerly before fetchQuestion reads it
 
       // 3. Load active question if any
       if (pollData.current_question_id) {
-        await fetchQuestion(pollData.current_question_id, participantData.id);
+        await fetchQuestion(pollData.current_question_id);
       }
     } catch (err) {
       console.error(err);
@@ -141,31 +179,39 @@ export default function ParticipantPlay() {
     } finally {
       setLoading(false);
     }
-  };
+  }
 
-  const fetchQuestion = async (qId, pId = participant?.id) => {
+  async function fetchQuestion(qId) {
+    // Always read from stable refs — never trust stale closure state
+    const pollId = pollIdRef.current;
+    const pId = participantIdRef.current;
+
+    if (!pollId) {
+      console.error('fetchQuestion: pollId not available yet');
+      return;
+    }
+
     try {
       currentQuestionIdRef.current = qId;
-      
-      // Fetch Question details
-      const { data: questionData, error: qError } = await supabase
-        .from('questions')
-        .select('*')
-        .eq('id', qId)
-        .single();
+      currentQuestionDataRef.current = null; // reset before fetch
 
-      if (qError) throw qError;
+      // Fetch Question details
+      const questionData = await getQuestionById(pollId, qId);
+
+      if (!questionData) throw new Error('Question not found');
 
       setCurrentQuestion(questionData);
-      
+      currentQuestionDataRef.current = questionData; // keep stable ref for auto-submit
+
       // Reset input fields
       setAnswerInput('');
       setSelectedOptions([]);
       setSelectionError('');
       setSelectedRating(0);
 
-      // Start local countdown for this question (30s)
-      setLocalCountdown(30);
+      // Start local countdown for this question (35s)
+      timerExpiredRef.current = false;
+      setLocalCountdown(35);
       if (localTimerRef.current) {
         clearInterval(localTimerRef.current);
       }
@@ -174,9 +220,8 @@ export default function ParticipantPlay() {
           if (prev <= 1) {
             clearInterval(localTimerRef.current);
             localTimerRef.current = null;
-            if (!userResponseRef.current && !submittingRef.current) {
-              handleSubmitAnswer(null);
-            }
+            // Signal expiry — actual submit fires in the useEffect below
+            timerExpiredRef.current = true;
             return 0;
           }
           return prev - 1;
@@ -185,14 +230,8 @@ export default function ParticipantPlay() {
 
       // Check if participant already answered this question
       if (pId) {
-        const { data: existingResponse, error: rError } = await supabase
-          .from('responses')
-          .select('*')
-          .eq('question_id', qId)
-          .eq('participant_id', pId)
-          .maybeSingle();
-
-        if (!rError && existingResponse) {
+        const existingResponse = await getResponseForParticipant(pollId, qId, pId);
+        if (existingResponse) {
           setUserResponse(existingResponse);
           userResponseRef.current = existingResponse;
           if (localTimerRef.current) {
@@ -207,18 +246,15 @@ export default function ParticipantPlay() {
     } catch (err) {
       console.error('Error fetching question:', err);
     }
-  };
+  }
 
-  const refreshPollState = async () => {
-    if (!poll?.id) return;
+  async function refreshPollState() {
+    const pollId = pollIdRef.current;
+    if (!pollId) return;
     try {
-      const { data: latestPoll, error: pollError } = await supabase
-        .from('polls')
-        .select('*')
-        .eq('id', poll.id)
-        .single();
+      const latestPoll = await getPollByJoinCode(code);
 
-      if (pollError || !latestPoll) return;
+      if (!latestPoll) return;
       setPoll(latestPoll);
 
       if (latestPoll.status === 'ended') {
@@ -228,18 +264,18 @@ export default function ParticipantPlay() {
       }
 
       if (latestPoll.current_question_id && latestPoll.current_question_id !== currentQuestionIdRef.current) {
-        await fetchQuestion(latestPoll.current_question_id);
+        await fetchQuestionRef.current(latestPoll.current_question_id);
       }
     } catch (err) {
       console.error('Error refreshing poll state:', err);
     }
-  };
+  }
 
   useEffect(() => {
     if (!poll?.id || poll.status !== 'active') return;
 
     const interval = setInterval(() => {
-      refreshPollState();
+      refreshPollStateRef.current();
     }, 2000);
 
     return () => clearInterval(interval);
@@ -247,33 +283,32 @@ export default function ParticipantPlay() {
 
   const handleSubmitAnswer = async (e) => {
     if (e) e.preventDefault();
-    if (!currentQuestion || !participant) return;
+    // Use stable ref so submit works even if currentQuestion state was cleared
+    const q = currentQuestionDataRef.current;
+    if (!q || !participant) return;
 
     let answerText = '';
     const isAutoSubmit = e === null;
 
-    if (currentQuestion.type === 'multiple_choice') {
-      // Auto-submit with selected options (or empty if none selected)
+    if (q.type === 'multiple_choice') {
       answerText = selectedOptions.length > 0 ? selectedOptions.join(', ') : '';
-    } else if (currentQuestion.type === 'rating') {
-      // Auto-submit with selected rating (or empty if none selected)
+    } else if (q.type === 'rating') {
       answerText = selectedRating > 0 ? selectedRating.toString() : '';
-    } else if (currentQuestion.type === 'open_text') {
-      // Auto-submit with typed answer (or empty if nothing typed)
+    } else if (q.type === 'open_text') {
       answerText = answerInput.trim();
     }
 
     // Only show errors if manually submitted (not auto-submit)
     if (!isAutoSubmit) {
-      if (currentQuestion.type === 'multiple_choice' && !selectedOptions.length) {
+      if (q.type === 'multiple_choice' && !selectedOptions.length) {
         setSelectionError('Please select at least one option.');
         return;
       }
-      if (currentQuestion.type === 'rating' && selectedRating === 0) {
+      if (q.type === 'rating' && selectedRating === 0) {
         setSelectionError('Please choose a rating.');
         return;
       }
-      if (currentQuestion.type === 'open_text' && !answerInput.trim()) {
+      if (q.type === 'open_text' && !answerInput.trim()) {
         setSelectionError('Please type an answer.');
         return;
       }
@@ -283,21 +318,11 @@ export default function ParticipantPlay() {
     submittingRef.current = true;
 
     try {
-      // Insert response into Supabase
-      const { data, error } = await supabase
-        .from('responses')
-        .insert({
-          question_id: currentQuestion.id,
-          participant_id: participant.id,
-          answer: answerText
-        })
-        .select()
-        .single();
-
-      if (error) throw error;
+      const data = await submitResponse(pollIdRef.current, q.id, participant, answerText);
 
       setUserResponse(data);
       userResponseRef.current = data;
+      currentQuestionDataRef.current = null;
       if (localTimerRef.current) {
         clearInterval(localTimerRef.current);
         localTimerRef.current = null;
@@ -310,6 +335,25 @@ export default function ParticipantPlay() {
       submittingRef.current = false;
     }
   };
+
+  // Keep stable refs in sync with latest state
+  useEffect(() => {
+    if (poll?.id) {
+      pollIdRef.current = poll.id;
+    }
+  }, [poll?.id]);
+
+  useEffect(() => {
+    if (participant?.id) {
+      participantIdRef.current = participant.id;
+    }
+  }, [participant?.id]);
+
+  useEffect(() => {
+    fetchQuestionRef.current = fetchQuestion;
+    handleSubmitAnswerRef.current = handleSubmitAnswer;
+    refreshPollStateRef.current = refreshPollState;
+  });
 
   if (loading) {
     return (
@@ -393,32 +437,47 @@ export default function ParticipantPlay() {
   }
 
   // Active question, needs answer submission
+  const timerPct = localCountdown > 0 ? (localCountdown / 35) * 100 : 0;
+  const timerColor = localCountdown > 18 ? 'var(--color-success)' : localCountdown > 8 ? 'var(--color-warning)' : 'var(--color-danger)';
+
   return (
     <div className="play-layout" style={{ marginTop: '1rem' }}>
       <div className="glass-card" style={{ padding: '2rem' }}>
+        {/* Timer bar */}
+        {localCountdown > 0 && (
+          <div style={{ marginBottom: '1.25rem' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
+              <span style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Time remaining</span>
+              <span style={{ fontSize: '1.1rem', fontWeight: 800, color: timerColor, minWidth: '2.5rem', textAlign: 'right' }}>{localCountdown}s</span>
+            </div>
+            <div style={{ height: '8px', background: 'rgba(100,116,139,0.15)', borderRadius: '50px', overflow: 'hidden' }}>
+              <div style={{ width: `${timerPct}%`, height: '100%', background: timerColor, borderRadius: '50px', transition: 'width 0.9s linear, background 0.3s ease' }} />
+            </div>
+          </div>
+        )}
+
         <div className="question-title-play">{currentQuestion.text}</div>
 
-        <form onSubmit={handleSubmitAnswer}>
-          {/* Render inputs depending on type */}
+        <div>
+          {/* Multiple choice */}
           {currentQuestion.type === 'multiple_choice' && (
             <div style={{ marginBottom: '1rem' }}>
-              {localCountdown > 0 && (
-                <div style={{ marginBottom: '0.5rem', fontWeight: 600, color: 'var(--color-accent)' }}>
-                  Time remaining: {localCountdown}s
-                </div>
-              )}
-              {(currentQuestion.options || []).map((option, idx) => {
-                const number = idx + 1;
+              <p style={{ marginBottom: '0.75rem', fontSize: '0.88rem', color: selectionError ? 'var(--color-danger)' : 'var(--text-muted)', fontWeight: selectionError ? 600 : 400 }}>
+                {selectionError || (selectedOptions.length > 0
+                  ? `${selectedOptions.length}/3 selected — auto-submits when timer ends`
+                  : 'Select up to 3 options — auto-submits when timer ends')}
+              </p>
+              {seededShuffle(currentQuestion.options || [], `${sessionId}_${currentQuestion.id}`).map((option, idx) => {
                 const isSelected = selectedOptions.includes(option);
                 return (
                   <button
-                    key={idx}
+                    key={option}
                     type="button"
                     className={`mc-option-button ${isSelected ? 'selected' : ''}`}
                     onClick={() => {
                       setSelectionError('');
                       if (isSelected) {
-                        setSelectedOptions((prev) => prev.filter((value) => value !== option));
+                        setSelectedOptions((prev) => prev.filter((v) => v !== option));
                       } else if (selectedOptions.length < 3) {
                         setSelectedOptions((prev) => [...prev, option]);
                       } else {
@@ -428,43 +487,42 @@ export default function ParticipantPlay() {
                     disabled={submitting || localCountdown === 0}
                   >
                     <span style={{ fontWeight: 500 }}>{option}</span>
-                    <span className="option-letter">{number}</span>
+                    <span className="option-letter">{idx + 1}</span>
                   </button>
                 );
               })}
-              <p style={{ marginTop: '0.75rem', fontSize: '0.95rem', color: selectionError ? 'var(--color-danger)' : 'var(--text-muted)' }}>
-                {selectionError || `Selected ${selectedOptions.length}/3 options.`}
+            </div>
+          )}
+
+          {/* Rating */}
+          {currentQuestion.type === 'rating' && (
+            <div style={{ textAlign: 'center' }}>
+              <div className="rating-button-row">
+                {[1, 2, 3, 4, 5].map((val) => (
+                  <button
+                    key={val}
+                    type="button"
+                    className={`rating-btn ${selectedRating === val ? 'selected' : ''}`}
+                    onClick={() => setSelectedRating(val)}
+                    disabled={submitting}
+                  >
+                    {val}
+                  </button>
+                ))}
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '1.5rem', marginTop: '-1.5rem', padding: '0 0.5rem' }}>
+                <span>Not Good</span>
+                <span>Excellent</span>
+              </div>
+              <p style={{ fontSize: '0.88rem', color: 'var(--text-muted)' }}>
+                {selectedRating > 0 ? `Rated ${selectedRating}/5 — submits when timer ends` : 'Pick a rating — auto-submits when timer ends'}
               </p>
             </div>
           )}
 
-          {currentQuestion.type === 'rating' && (
-            <div style={{ textAlign: 'center' }}>
-              <div className="rating-button-row">
-                {[1, 2, 3, 4, 5].map((val) => {
-                  const isSelected = selectedRating === val;
-                  return (
-                    <button
-                      key={val}
-                      type="button"
-                      className={`rating-btn ${isSelected ? 'selected' : ''}`}
-                      onClick={() => setSelectedRating(val)}
-                      disabled={submitting}
-                    >
-                      {val}
-                    </button>
-                  );
-                })}
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '2rem', marginTop: '-1.5rem', padding: '0 0.5rem' }}>
-                <span>Not Good</span>
-                <span>Excellent</span>
-              </div>
-            </div>
-          )}
-
+          {/* Open text */}
           {currentQuestion.type === 'open_text' && (
-            <div className="form-group" style={{ marginBottom: '2rem' }}>
+            <div className="form-group" style={{ marginBottom: '1.5rem' }}>
               <textarea
                 className="form-textarea"
                 rows={4}
@@ -473,18 +531,21 @@ export default function ParticipantPlay() {
                 value={answerInput}
                 onChange={(e) => setAnswerInput(e.target.value)}
                 disabled={submitting}
-                required
               />
-              <div style={{ display: 'flex', justifyContent: 'flex-end', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                {answerInput.length}/200 characters
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                <span>Auto-submits when timer ends</span>
+                <span>{answerInput.length}/200</span>
               </div>
             </div>
           )}
 
-          <button type="submit" className="btn btn-primary" style={{ width: '100%' }} disabled={submitting}>
-            {submitting ? <div className="spinner"></div> : <><Send size={16} /> Submit Answer</>}
-          </button>
-        </form>
+          {submitting && (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem', padding: '0.75rem', color: 'var(--color-primary)', fontWeight: 600 }}>
+              <div className="spinner" style={{ width: '18px', height: '18px' }}></div>
+              Submitting...
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
