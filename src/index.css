@@ -524,22 +524,22 @@ p {
 .result-bar-wrapper {
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
+  gap: 0.3rem;
 }
 
 .result-bar-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  font-size: 0.95rem;
+  font-size: 0.88rem;
 }
 
 .result-bar-label { font-weight: 500; color: var(--text-primary); }
 
-.result-bar-stats { color: var(--text-secondary); font-size: 0.85rem; }
+.result-bar-stats { color: var(--text-secondary); font-size: 0.8rem; }
 
 .result-bar-bg {
-  height: 24px;
+  height: 14px;
   background: rgba(100, 116, 139, 0.08);
   border: 1px solid var(--border-color);
   border-radius: 50px;

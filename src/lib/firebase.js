@@ -246,6 +246,10 @@ export const getQuestionById = async (pollId, qId) => {
  * Atomically save the poll title and rewrite all questions in a single batch.
  * Returns the freshly saved question list so callers don't need a second fetch.
  */
+export const updateQuestion = async (pollId, questionId, updates) => {
+  await updateDoc(doc(db, 'polls', pollId, 'questions', questionId), updates);
+};
+
 export const saveDraftQuestions = async (pollId, title, questions) => {
   const existingSnap = await getDocs(collection(db, 'polls', pollId, 'questions'));
   const batch = writeBatch(db);

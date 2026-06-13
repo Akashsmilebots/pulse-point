@@ -8,6 +8,9 @@ export default function Dashboard() {
   const [polls, setPolls] = useState([]);
   const [loading, setLoading] = useState(true);
   const [copiedId, setCopiedId] = useState(null);
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [deleteConfirmText, setDeleteConfirmText] = useState('');
+  const [pollToDelete, setPollToDelete] = useState(null);
   const navigate = useNavigate();
   const hostId = getHostId();
 
@@ -38,18 +41,25 @@ export default function Dashboard() {
     fetchPolls();
   }, [username, phone, navigate]);
 
-  const handleDelete = async (poll) => {
+  const handleDeleteClick = (poll) => {
     const isMyPoll = poll.host_id === (auth.currentUser ? auth.currentUser.uid : null) || poll.host_id === hostId;
     if (!isMyPoll) {
       alert('You can only delete polls you created.');
       return;
     }
-    if (!window.confirm('Are you sure you want to delete this poll and all its responses? This cannot be undone.')) {
-      return;
-    }
+    setPollToDelete(poll);
+    setDeleteConfirmText('');
+    setShowDeleteDialog(true);
+  };
+
+  const handleDeleteConfirm = async () => {
+    if (!pollToDelete) return;
     try {
-      await deletePoll(poll.id);
-      setPolls(polls.filter(p => p.id !== poll.id));
+      await deletePoll(pollToDelete.id);
+      setPolls(polls.filter(p => p.id !== pollToDelete.id));
+      setShowDeleteDialog(false);
+      setPollToDelete(null);
+      setDeleteConfirmText('');
     } catch (err) {
       console.error('Error deleting poll:', err);
       alert('Failed to delete poll.');
@@ -179,7 +189,7 @@ export default function Dashboard() {
                   {isMyPoll && (
                     <button
                       className="btn btn-sm btn-danger"
-                      onClick={() => handleDelete(poll)}
+                      onClick={() => handleDeleteClick(poll)}
                       title="Delete Poll"
                     >
                       <Trash2 size={14} />
@@ -189,6 +199,43 @@ export default function Dashboard() {
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* Delete confirmation dialog */}
+      {showDeleteDialog && pollToDelete && (
+        <div style={{ position: 'fixed', inset: 0, zIndex: 999, background: 'rgba(0,0,0,0.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' }}>
+          <div className="glass-card" style={{ padding: '1.75rem', maxWidth: '440px', width: '100%', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+            <div>
+              <h3 style={{ margin: '0 0 0.35rem', fontSize: '1.05rem', fontWeight: 700, color: 'var(--color-danger)' }}>Delete Poll</h3>
+              <p style={{ margin: 0, fontSize: '0.85rem', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                This will <strong>permanently delete</strong> all questions, participant registrations, and responses. To confirm, type the event name exactly:
+              </p>
+            </div>
+            <div style={{ padding: '0.6rem 0.85rem', borderRadius: '10px', background: 'rgba(220,42,60,0.07)', border: '1px solid rgba(220,42,60,0.2)', fontSize: '0.9rem', fontWeight: 700, color: 'var(--color-danger)', textAlign: 'center', wordBreak: 'break-word' }}>
+              {pollToDelete.title}
+            </div>
+            <input
+              type="text"
+              className="form-input"
+              placeholder="Type event name to confirm"
+              value={deleteConfirmText}
+              onChange={e => setDeleteConfirmText(e.target.value)}
+              autoFocus
+              style={{ fontSize: '0.92rem' }}
+            />
+            <div style={{ display: 'flex', gap: '0.6rem', justifyContent: 'flex-end' }}>
+              <button className="btn btn-secondary" onClick={() => { setShowDeleteDialog(false); setPollToDelete(null); setDeleteConfirmText(''); }}>
+                Cancel
+              </button>
+              <button className="btn btn-danger"
+                disabled={deleteConfirmText !== pollToDelete.title}
+                onClick={handleDeleteConfirm}
+                style={{ opacity: deleteConfirmText !== pollToDelete.title ? 0.4 : 1 }}>
+                <Trash2 size={14} /> Delete Poll
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

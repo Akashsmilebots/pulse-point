@@ -105,7 +105,7 @@ export default function ParticipantPlay() {
           clearInterval(localTimerRef.current);
           localTimerRef.current = null;
         }
-        await fetchQuestionRef.current(nextQuestionId);
+        await fetchQuestionRef.current(nextQuestionId, updatedPoll.question_end_time);
       }
     });
 
@@ -171,7 +171,7 @@ export default function ParticipantPlay() {
 
       // 3. Load active question if any
       if (pollData.current_question_id) {
-        await fetchQuestion(pollData.current_question_id);
+        await fetchQuestion(pollData.current_question_id, pollData.question_end_time);
       }
     } catch (err) {
       console.error(err);
@@ -181,7 +181,7 @@ export default function ParticipantPlay() {
     }
   }
 
-  async function fetchQuestion(qId) {
+  async function fetchQuestion(qId, questionEndTime = null) {
     // Always read from stable refs — never trust stale closure state
     const pollId = pollIdRef.current;
     const pId = participantIdRef.current;
@@ -209,9 +209,10 @@ export default function ParticipantPlay() {
       setSelectionError('');
       setSelectedRating(0);
 
-      // Start local countdown for this question (35s)
+      // Start local countdown — sync to host's end time if available
+      const remaining = questionEndTime ? Math.max(1, Math.round((questionEndTime - Date.now()) / 1000)) : 35;
       timerExpiredRef.current = false;
-      setLocalCountdown(35);
+      setLocalCountdown(remaining);
       if (localTimerRef.current) {
         clearInterval(localTimerRef.current);
       }
@@ -264,7 +265,7 @@ export default function ParticipantPlay() {
       }
 
       if (latestPoll.current_question_id && latestPoll.current_question_id !== currentQuestionIdRef.current) {
-        await fetchQuestionRef.current(latestPoll.current_question_id);
+        await fetchQuestionRef.current(latestPoll.current_question_id, latestPoll.question_end_time);
       }
     } catch (err) {
       console.error('Error refreshing poll state:', err);
@@ -272,7 +273,7 @@ export default function ParticipantPlay() {
   }
 
   useEffect(() => {
-    if (!poll?.id || poll.status !== 'active') return;
+    if (!poll?.id || (poll.status !== 'active' && poll.status !== 'paused')) return;
 
     const interval = setInterval(() => {
       refreshPollStateRef.current();
@@ -396,48 +397,74 @@ export default function ParticipantPlay() {
     );
   }
 
+  // Reusable banner waiting screen (used for waiting + post-submit)
+  const BannerWaitScreen = ({ icon, title, subtitle, extraContent }) => {
+    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(`${window.location.origin}/join/${poll?.join_code || ''}`)}&bgcolor=ffffff&color=000000&margin=10`;
+    return (
+      <div style={{ position: 'fixed', inset: 0, zIndex: 10, background: '#fff', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '1.25rem', gap: '0.85rem', overflow: 'auto' }}>
+        {/* Logo */}
+        <img src="/logo.png" alt="Logo" style={{ height: '30px', objectFit: 'contain', opacity: 0.85, flexShrink: 0 }} />
+        {/* Long banner card — full image at natural aspect ratio */}
+        <div style={{ position: 'relative', width: '100%', maxWidth: '480px', borderRadius: '12px', overflow: 'hidden', boxShadow: '0 4px 20px rgba(0,0,0,0.13)', flexShrink: 0 }}>
+          <img src="/banner.jpeg" alt="" style={{ width: '100%', height: 'auto', display: 'block' }} />
+          {/* Light overlay — keeps banner readable */}
+          <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.32)' }} />
+        </div>
+        {/* Message card */}
+        <div style={{ background: '#fff', borderRadius: '12px', padding: '1rem 1.25rem', textAlign: 'center', maxWidth: '480px', width: '100%', border: '1px solid #E2E4E9', boxShadow: '0 2px 10px rgba(0,0,0,0.06)' }}>
+          {icon && <div style={{ marginBottom: '0.5rem' }}>{icon}</div>}
+          <h2 style={{ fontSize: '1.2rem', fontWeight: 700, color: '#16181D', margin: '0 0 0.25rem' }}>{title}</h2>
+          {subtitle && <p style={{ color: '#6B7280', margin: 0, fontSize: '0.85rem' }}>{subtitle}</p>}
+          {extraContent}
+        </div>
+        {/* QR code */}
+        <div style={{ background: '#F7F8FA', borderRadius: '10px', padding: '0.65rem', textAlign: 'center', border: '1px solid #E2E4E9', flexShrink: 0 }}>
+          <img src={qrUrl} alt="Join QR" style={{ width: '110px', height: '110px', display: 'block', borderRadius: '4px' }} />
+          <p style={{ margin: '0.3rem 0 0', fontSize: '0.75rem', color: '#374151', fontWeight: 600 }}>Join: {poll?.join_code}</p>
+        </div>
+      </div>
+    );
+  };
+
+  // Session paused
+  if (poll?.status === 'paused') {
+    return (
+      <BannerWaitScreen
+        icon={<span style={{ fontSize: '2.5rem', lineHeight: 1 }}>⏸</span>}
+        title="Session Paused"
+        subtitle="The host has paused the session. It will resume shortly — stay on this page!"
+      />
+    );
+  }
+
   // Poll is waiting/not active state
   if (poll?.status === 'draft' || !currentQuestion) {
     return (
-      <div className="play-layout" style={{ marginTop: '2rem' }}>
-        <div className="glass-card" style={{ padding: '2.5rem', textAlign: 'center' }}>
-          <RefreshCw className="spinner" size={48} style={{ animationDuration: '3s', marginBottom: '1.5rem', color: 'var(--color-primary)' }} />
-          <h2>Waiting for Host</h2>
-          <p style={{ margin: '1rem 0' }}>
-            Hey <strong>{participant?.name}</strong>! Get ready, the host is preparing to launch the live poll question.
-          </p>
-          <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-            This screen will update automatically.
-          </p>
-        </div>
-      </div>
+      <BannerWaitScreen
+        icon={<RefreshCw className="spinner" size={40} color="#2B5FD9" style={{ animationDuration: '2s' }} />}
+        title="Waiting for Host"
+        subtitle={`Hey ${participant?.name || 'there'}! Get ready — the host is preparing the next question.`}
+      />
     );
   }
 
   // Question exists, and has been submitted
   if (userResponse) {
     return (
-      <div className="play-layout" style={{ marginTop: '2rem' }}>
-        <div className="glass-card" style={{ padding: '2.5rem', textAlign: 'center' }}>
-          <div style={{ background: 'rgba(16, 185, 129, 0.1)', width: '60px', height: '60px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifySelf: 'center', justifyContent: 'center', marginBottom: '1.5rem', border: '1px solid rgba(16, 185, 129, 0.3)' }}>
-            <Check size={32} color="var(--color-success)" />
+      <BannerWaitScreen
+        icon={
+          <div style={{ background: 'rgba(16,185,129,0.2)', width: '64px', height: '64px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', border: '2px solid rgba(16,185,129,0.6)', margin: '0 auto' }}>
+            <Check size={36} color="#10B981" />
           </div>
-          <h2>Response Submitted!</h2>
-          <p style={{ margin: '1rem 0 2rem 0' }}>
-            Your answer: <strong style={{ color: 'var(--text-primary)' }}>{userResponse.answer}</strong> has been cast.
-          </p>
-          <div style={{ background: 'rgba(255, 255, 255, 0.02)', padding: '1rem', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-color)' }}>
-            <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-              Hold tight. The host will switch to the next question shortly!
-            </p>
-          </div>
-        </div>
-      </div>
+        }
+        title="Response Submitted!"
+        subtitle="Hold tight — the host will launch the next question shortly."
+      />
     );
   }
 
   // Active question, needs answer submission
-  const timerPct = localCountdown > 0 ? (localCountdown / 35) * 100 : 0;
+  const timerPct = localCountdown > 0 ? Math.min(100, (localCountdown / 35) * 100) : 0;
   const timerColor = localCountdown > 18 ? 'var(--color-success)' : localCountdown > 8 ? 'var(--color-warning)' : 'var(--color-danger)';
 
   return (
@@ -487,7 +514,6 @@ export default function ParticipantPlay() {
                     disabled={submitting || localCountdown === 0}
                   >
                     <span style={{ fontWeight: 500 }}>{option}</span>
-                    <span className="option-letter">{idx + 1}</span>
                   </button>
                 );
               })}
