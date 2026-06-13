@@ -15,7 +15,8 @@ import {
   syncHostAuthUid
 } from '../lib/firebase';
 import { getHostId } from '../utils';
-import { ArrowLeft, Play, Square, RefreshCw, Users, Copy, Check, ChevronRight, ChevronLeft, Plus, Save, Monitor, ExternalLink } from 'lucide-react';
+import { ArrowLeft, Play, Square, RefreshCw, Users, Copy, Check, ChevronRight, ChevronLeft, Plus, Save, Monitor, ExternalLink, FileDown } from 'lucide-react';
+import jsPDF from 'jspdf';
 
 export default function HostLive() {
   const { id } = useParams();
@@ -45,6 +46,7 @@ export default function HostLive() {
   const [projectorTab, setProjectorTab] = useState('home');
   const [projectorLbRange, setProjectorLbRange] = useState(-1);
   const [qTabSelectedQ, setQTabSelectedQ] = useState(null);
+  const [responseNavInput, setResponseNavInput] = useState('');
   const questionTimerRef = useRef(null);
   // Keep a ref to the active question ID for the realtime channel callback
   const activeQuestionIdRef = useRef(null);
@@ -807,6 +809,90 @@ export default function HostLive() {
     return null;
   };
 
+  const downloadQuestionPDF = (q, resps, qNum) => {
+    const doc = new jsPDF();
+    const margin = 14;
+    let y = 20;
+
+    doc.setFontSize(18);
+    doc.setFont('helvetica', 'bold');
+    doc.text(poll.title || 'Pulse Point', margin, y);
+    y += 10;
+
+    doc.setFontSize(11);
+    doc.setFont('helvetica', 'normal');
+    doc.setTextColor(100);
+    const top10Count = q.type === 'rating' ? Math.min(resps.length, 5) : Math.min(resps.length, 10);
+    doc.text(`Question ${qNum}  ·  ${q.type.replace('_', ' ')}  ·  Top ${top10Count} of ${resps.length} response${resps.length !== 1 ? 's' : ''}`, margin, y);
+    y += 8;
+
+    doc.setDrawColor(200);
+    doc.line(margin, y, 196, y);
+    y += 8;
+
+    doc.setFontSize(13);
+    doc.setTextColor(0);
+    doc.setFont('helvetica', 'bold');
+    const qLines = doc.splitTextToSize(q.text || '', 180);
+    doc.text(qLines, margin, y);
+    y += qLines.length * 7 + 6;
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(10);
+
+    if (q.type === 'multiple_choice') {
+      const opts = q.options || [];
+      const tallies = {};
+      opts.forEach(o => { tallies[o] = 0; });
+      resps.forEach(r => {
+        (r.answer || '').split(',').map(s => s.trim()).filter(Boolean).forEach(a => {
+          if (tallies[a] !== undefined) tallies[a]++;
+        });
+      });
+      const sorted = opts.slice().sort((a, b) => (tallies[b] || 0) - (tallies[a] || 0)).slice(0, 10);
+      sorted.forEach((opt, idx) => {
+        if (y > 270) { doc.addPage(); y = 20; }
+        const votes = tallies[opt] || 0;
+        const pct = resps.length > 0 ? Math.round(votes / resps.length * 100) : 0;
+        doc.setFont('helvetica', 'bold');
+        doc.text(`#${idx + 1}`, margin, y);
+        doc.setFont('helvetica', 'normal');
+        const optLines = doc.splitTextToSize(opt, 140);
+        doc.text(optLines, margin + 12, y);
+        doc.text(`${votes} (${pct}%)`, 170, y, { align: 'right' });
+        y += optLines.length * 6 + 3;
+      });
+    } else if (q.type === 'rating') {
+      let sum = 0;
+      const rt = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+      resps.forEach(r => { const v = parseInt(r.answer, 10); if (!isNaN(v)) { sum += v; rt[v] = (rt[v] || 0) + 1; } });
+      const avg = resps.length > 0 ? (sum / resps.length).toFixed(1) : '0.0';
+      doc.setFont('helvetica', 'bold');
+      doc.text(`Average: ${avg} / 5`, margin, y); y += 8;
+      doc.setFont('helvetica', 'normal');
+      [5, 4, 3, 2, 1].forEach(stars => {
+        if (y > 270) { doc.addPage(); y = 20; }
+        const count = rt[stars] || 0;
+        const pct = resps.length > 0 ? Math.round(count / resps.length * 100) : 0;
+        doc.text(`${'★'.repeat(stars)}${'☆'.repeat(5 - stars)}  ${count} response${count !== 1 ? 's' : ''} (${pct}%)`, margin, y);
+        y += 7;
+      });
+    } else {
+      resps.slice(0, 10).forEach((r, idx) => {
+        if (y > 270) { doc.addPage(); y = 20; }
+        const name = r.participants ? r.participants.name : 'Anonymous';
+        doc.setFont('helvetica', 'bold');
+        doc.text(`${idx + 1}.`, margin, y);
+        doc.setFont('helvetica', 'normal');
+        const lines = doc.splitTextToSize(`"${r.answer}"  — ${name}`, 168);
+        doc.text(lines, margin + 8, y);
+        y += lines.length * 6 + 3;
+      });
+    }
+
+    doc.save(`Q${qNum}-responses.pdf`);
+  };
+
   if (loading) {
     return (
       <div style={{ display: 'flex', justifyContent: 'center', margin: '4rem 0' }}>
@@ -871,6 +957,46 @@ export default function HostLive() {
         optionText.includes(searchLower)
       );
     });
+
+  // Response Navigator computed values
+  const respNavNum = parseInt(responseNavInput.trim(), 10);
+  const isValidRespNav = !isNaN(respNavNum) && respNavNum >= 1;
+  const respNavQIdx = isValidRespNav ? Math.floor((respNavNum - 1) / 10) : -1;
+  const respNavRIdx = isValidRespNav ? (respNavNum - 1) % 10 : -1;
+  const respNavQ = respNavQIdx >= 0 && respNavQIdx < questions.length ? questions[respNavQIdx] : null;
+  const respNavResps = respNavQ ? (allResponses[respNavQ.id] || []) : [];
+  const respNavQNum = respNavQIdx + 1;
+
+  // Build the ordered top-10 list for the response navigator
+  const getRespNavRows = (q, resps) => {
+    if (!q) return [];
+    if (q.type === 'multiple_choice') {
+      const opts = q.options || [];
+      const tallies = {};
+      opts.forEach(o => { tallies[o] = 0; });
+      resps.forEach(r => {
+        (r.answer || '').split(',').map(s => s.trim()).filter(Boolean).forEach(a => {
+          if (tallies[a] !== undefined) tallies[a]++;
+        });
+      });
+      return opts.slice().sort((a, b) => (tallies[b] || 0) - (tallies[a] || 0)).slice(0, 10).map(opt => ({
+        label: opt,
+        sub: `${tallies[opt] || 0} vote${tallies[opt] !== 1 ? 's' : ''}`
+      }));
+    }
+    if (q.type === 'rating') {
+      const rt = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+      resps.forEach(r => { const v = parseInt(r.answer, 10); if (!isNaN(v)) rt[v] = (rt[v] || 0) + 1; });
+      return [5, 4, 3, 2, 1].map(stars => ({
+        label: `${'★'.repeat(stars)}${'☆'.repeat(5 - stars)}`,
+        sub: `${rt[stars] || 0} response${rt[stars] !== 1 ? 's' : ''}`
+      }));
+    }
+    return resps.slice(0, 10).map(r => ({
+      label: r.answer || '(empty)',
+      sub: r.participants ? r.participants.name : 'Anonymous'
+    }));
+  };
 
   return (
     <div>
@@ -1399,22 +1525,22 @@ export default function HostLive() {
 
         {/* Sidebar — Questions Navigator */}
         <div className="live-sidebar">
-          <div className="glass-card" style={{ padding: '1.5rem', display: 'flex', flexDirection: 'column', gap: '1rem', flex: 1 }}>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-              <h3 style={{ fontSize: '1.1rem', borderBottom: '1px solid var(--border-color)', paddingBottom: '0.5rem' }}>Questions Navigator</h3>
+          <div className="glass-card" style={{ padding: '1.25rem', display: 'flex', flexDirection: 'column', gap: '0.85rem', flex: 1 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+              <h3 style={{ fontSize: '1rem', borderBottom: '1px solid var(--border-color)', paddingBottom: '0.5rem', margin: 0 }}>Questions Navigator</h3>
               <input
                 type="search"
                 className="form-input"
-                placeholder="Search question, number, or options"
+                placeholder="Search question…"
                 value={questionSearch}
                 onChange={(e) => setQuestionSearch(e.target.value)}
-                style={{ width: '100%' }}
+                style={{ width: '100%', fontSize: '0.85rem' }}
               />
             </div>
-            
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', overflowY: 'auto', maxHeight: '400px' }}>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', overflowY: 'auto', maxHeight: '420px' }}>
               {filteredQuestions.length === 0 ? (
-                <div style={{ padding: '1rem', border: '1px dashed var(--border-color)', borderRadius: '16px', color: 'var(--text-secondary)' }}>
+                <div style={{ padding: '1rem', border: '1px dashed var(--border-color)', borderRadius: '16px', color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
                   No matching questions found.
                 </div>
               ) : (
@@ -1430,21 +1556,123 @@ export default function HostLive() {
                       onClick={() => handleQTabSelectQuestion(q)}
                       disabled={!isPollInteractive || !hasResponses}
                       title={!hasResponses ? 'No responses yet — start this question to enable' : ''}
+                      style={{ padding: '0.65rem 0.85rem' }}
                     >
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem' }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-                          <span style={{ fontSize: '0.75rem', textTransform: 'uppercase', fontWeight: 700 }}>Question {q.questionNumber}</span>
+                          <span style={{ fontSize: '0.72rem', textTransform: 'uppercase', fontWeight: 700 }}>Q{q.questionNumber}</span>
                           {isLiveQ && <span style={{ fontSize: '0.6rem', fontWeight: 700, color: '#fff', background: '#DC2A3C', borderRadius: '4px', padding: '1px 5px', lineHeight: 1.4 }}>LIVE</span>}
                           {hasResponses && !isLiveQ && <span style={{ fontSize: '0.6rem', fontWeight: 700, color: '#16A34A', background: 'rgba(34,197,94,0.12)', border: '1px solid rgba(34,197,94,0.25)', borderRadius: '4px', padding: '1px 5px', lineHeight: 1.4 }}>✓</span>}
                         </div>
-                        <span style={{ fontSize: '0.9rem', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
+                        <span style={{ fontSize: '0.82rem', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' }}>
                           {q.text}
                         </span>
                       </div>
                     </button>
                   );
-                }) )}
+                })
+              )}
             </div>
+          </div>
+        </div>
+
+        {/* Response Navigator */}
+        <div className="live-sidebar">
+          <div className="glass-card" style={{ padding: '1.25rem', display: 'flex', flexDirection: 'column', gap: '0.85rem', flex: 1 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+              <h3 style={{ fontSize: '1rem', borderBottom: '1px solid var(--border-color)', paddingBottom: '0.5rem', margin: 0 }}>Response Navigator</h3>
+              <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', lineHeight: 1.4 }}>
+                Q1→1-10 · Q2→11-20 · Q3→21-30…
+              </div>
+              <input
+                type="number"
+                className="form-input"
+                placeholder="Type number (e.g. 72)"
+                value={responseNavInput}
+                min={1}
+                onChange={(e) => {
+                  setResponseNavInput(e.target.value);
+                  const n = parseInt(e.target.value, 10);
+                  if (!isNaN(n) && n >= 1) {
+                    const qIdx = Math.floor((n - 1) / 10);
+                    if (qIdx >= 0 && qIdx < questions.length) {
+                      handleQTabSelectQuestion(questions[qIdx]);
+                    }
+                  }
+                }}
+                style={{ width: '100%', fontSize: '0.85rem' }}
+              />
+            </div>
+
+            {/* Target info */}
+            {isValidRespNav && (
+              <div style={{ fontSize: '0.78rem', padding: '0.45rem 0.7rem', borderRadius: '8px', background: 'rgba(43,95,217,0.06)', border: '1px solid rgba(43,95,217,0.18)', color: 'var(--color-primary)', fontWeight: 600 }}>
+                {respNavQ
+                  ? `Q${respNavQNum} · Response #${respNavRIdx + 1}`
+                  : `Q${respNavQNum} out of range`}
+              </div>
+            )}
+
+            {/* Response list */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', overflowY: 'auto', maxHeight: '300px' }}>
+              {respNavQ ? (() => {
+                const rows = getRespNavRows(respNavQ, respNavResps);
+                if (rows.length === 0) {
+                  return (
+                    <div style={{ padding: '0.75rem', border: '1px dashed var(--border-color)', borderRadius: '10px', color: 'var(--text-secondary)', fontSize: '0.82rem' }}>
+                      No responses recorded for Q{respNavQNum} yet.
+                    </div>
+                  );
+                }
+                return rows.map((row, idx) => {
+                  const globalNum = (respNavQIdx) * 10 + idx + 1;
+                  const isHighlighted = idx === respNavRIdx;
+                  return (
+                    <div key={idx} style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-start', padding: '0.45rem 0.6rem', borderRadius: '8px', background: isHighlighted ? 'rgba(43,95,217,0.09)' : 'var(--bg-card, #fff)', border: `1.5px solid ${isHighlighted ? 'rgba(43,95,217,0.4)' : 'var(--border-color)'}`, transition: 'all 0.15s' }}>
+                      <span style={{ fontSize: '0.7rem', fontWeight: 800, color: isHighlighted ? 'var(--color-primary)' : 'var(--text-muted)', minWidth: '22px', paddingTop: '1px' }}>{globalNum}</span>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: '0.82rem', fontWeight: isHighlighted ? 700 : 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: isHighlighted ? 'var(--color-primary)' : 'var(--text-primary)' }}>{row.label}</div>
+                        <div style={{ fontSize: '0.7rem', color: 'var(--text-secondary)' }}>{row.sub}</div>
+                      </div>
+                      {isHighlighted && <span style={{ fontSize: '0.6rem', fontWeight: 700, color: 'var(--color-primary)', background: 'rgba(43,95,217,0.12)', borderRadius: '4px', padding: '2px 5px', flexShrink: 0 }}>▶</span>}
+                    </div>
+                  );
+                });
+              })() : !isValidRespNav ? (
+                <div style={{ padding: '0.75rem', border: '1px dashed var(--border-color)', borderRadius: '10px', color: 'var(--text-secondary)', fontSize: '0.82rem' }}>
+                  Enter a number to jump to a response.
+                </div>
+              ) : null}
+            </div>
+
+            {/* PDF download — per question, only if it has responses */}
+            {(() => {
+              const qList = questions.map((q, idx) => ({ ...q, qNum: idx + 1 }));
+              const hasAnyPDF = qList.some(q => (allResponses[q.id]?.length ?? 0) > 0);
+              if (!hasAnyPDF) return null;
+              return (
+                <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: '0.75rem' }}>
+                  <div style={{ fontSize: '0.75rem', fontWeight: 700, color: 'var(--text-secondary)', marginBottom: '0.45rem', textTransform: 'uppercase', letterSpacing: '0.04em' }}>Download PDF</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', maxHeight: '180px', overflowY: 'auto' }}>
+                    {qList.map(q => {
+                      const qResps = allResponses[q.id] || [];
+                      if (qResps.length === 0) return null;
+                      return (
+                        <button key={q.id}
+                          className="btn btn-secondary btn-sm"
+                          style={{ justifyContent: 'flex-start', gap: '0.4rem', fontSize: '0.78rem', padding: '0.35rem 0.6rem' }}
+                          onClick={() => downloadQuestionPDF(q, qResps, q.qNum)}
+                        >
+                          <FileDown size={13} />
+                          Q{q.qNum} — {qResps.length} response{qResps.length !== 1 ? 's' : ''}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })()}
+
           </div>
         </div>
 

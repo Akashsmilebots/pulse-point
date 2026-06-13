@@ -731,8 +731,12 @@ p {
 /* Host Live view */
 .live-layout {
   display: grid;
-  grid-template-columns: 2fr 1fr;
-  gap: 2rem;
+  grid-template-columns: 1.5fr 1fr 1fr;
+  gap: 1.5rem;
+}
+
+@media (max-width: 1100px) {
+  .live-layout { grid-template-columns: 1.5fr 1fr 1fr; gap: 1rem; }
 }
 
 @media (max-width: 900px) {
